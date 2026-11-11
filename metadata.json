@@ -1,0 +1,6 @@
+{
+  "name": "Bút Chì Thông Minh — Học Tập & Tích Sao Tiểu Học",
+  "description": "Nền tảng học tập tương tác cho học sinh tiểu học (Lớp 1–5) với AI quét sách giáo khoa ra đề, bài tập hình học trực quan, bảng nháp ô ly, từ điển tiếng Việt, đọc phát âm tiếng Anh và tích lũy phút xem YouTube đổi sao.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
