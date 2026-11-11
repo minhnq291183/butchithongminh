@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   GeometrySpec,
   MistakeRecord,
@@ -12,21 +12,27 @@ import {
 import { SUBJECT_META } from "../data/seedData";
 import { GeometryVisual } from "./GeometryVisual";
 import {
+  Activity,
+  AlertTriangle,
   BookOpen,
   Check,
   CheckCircle2,
+  Cpu,
   Edit3,
   FileText,
   Filter,
   Loader2,
   Plus,
+  RefreshCw,
+  RotateCcw,
   Sparkles,
   Trash2,
   Upload,
-  AlertTriangle,
 } from "lucide-react";
 
 interface TeacherPortalProps {
+  activeChildId: string;
+  activeChildName: string;
   grade: number;
   textbooks: TextbookMaterial[];
   questions: QuestionItem[];
@@ -37,20 +43,43 @@ interface TeacherPortalProps {
   onApproveQuestion: (id: string, updated?: QuestionItem) => void;
   onApproveAllPending: () => void;
   onDeleteQuestion: (id: string) => void;
+  onRestoreCompletedQuestion: (questionId: string) => void;
+  onRestoreAllCompletedQuestions: () => void;
   onExportBackup: () => void;
   onImportBackup: (file: File) => void;
 }
 
-const GEOMETRY_CATEGORIES = [
-  "Nhận biết hình và đếm cạnh/đỉnh",
-  "Tính chu vi hình chữ nhật, hình vuông, tam giác",
-  "Tính diện tích hình chữ nhật, hình vuông, hình ghép",
-  "Trắc nghiệm 4 đáp án",
-  "Điền số / Điền từ vào chỗ trống",
-  "Sắp xếp từ thành câu / Sắp xếp thứ tự",
+export const AI_MODEL_OPTIONS = [
+  {
+    id: "gemini-3.8-flash",
+    label: "Gemini 3.8 Flash (Khuyên dùng — Chuẩn xác & Nhanh)",
+    badge: "Mặc định",
+  },
+  {
+    id: "gemini-3.1-flash-lite",
+    label: "Gemini 3.1 Flash Lite (Siêu nhanh — Tiết kiệm hạn mức Key nhất)",
+    badge: "Nhẹ & Nhanh",
+  },
+  {
+    id: "gemini-flash-latest",
+    label: "Gemini Flash Latest (Ổn định — Tương thích rộng mọi API Key)",
+    badge: "Ổn định",
+  },
+  {
+    id: "gemini-4-argon",
+    label: "Gemini 4 Argon / Pro (Chuyên sâu Toán nâng cao — Cần Key trả phí)",
+    badge: "Pro",
+  },
+  {
+    id: "gemini-4-carbon",
+    label: "Gemini 4 Carbon (Tư duy logic sâu nhất — Cần Key trả phí)",
+    badge: "Deep",
+  },
 ];
 
 export const TeacherPortal: React.FC<TeacherPortalProps> = ({
+  activeChildId,
+  activeChildName,
   grade,
   textbooks,
   questions,
@@ -61,14 +90,30 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
   onApproveQuestion,
   onApproveAllPending,
   onDeleteQuestion,
+  onRestoreCompletedQuestion,
+  onRestoreAllCompletedQuestions,
   onExportBackup,
   onImportBackup,
 }) => {
   const [activeSubTab, setActiveSubTab] = useState<
-    "review_queue" | "ai_generator" | "textbooks" | "manual_create" | "approved_bank"
+    | "review_queue"
+    | "ai_generator"
+    | "textbooks"
+    | "manual_create"
+    | "approved_bank"
+    | "completed_bank"
   >("review_queue");
 
-  // 1. Textbook Scanner State
+  // Shared Selected AI Model + Diagnostic Check State
+  const [selectedModel, setSelectedModel] = useState<string>("gemini-3.8-flash");
+  const [checkingKey, setCheckingKey] = useState<boolean>(false);
+  const [keyStatusResult, setKeyStatusResult] = useState<{
+    ok: boolean;
+    message: string;
+    hint?: string;
+  } | null>(null);
+
+  // 1. Textbook Scanner State + Progress Bar
   const [tbTitle, setTbTitle] = useState<string>("");
   const [tbSubject, setTbSubject] = useState<SubjectId>("math");
   const [tbGrade, setTbGrade] = useState<number>(grade);
@@ -76,24 +121,84 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
   const [tbImageBase64, setTbImageBase64] = useState<string>("");
   const [tbMimeType, setTbMimeType] = useState<string>("");
   const [tbFileName, setTbFileName] = useState<string>("");
+  const [tbFileSizeKb, setTbFileSizeKb] = useState<number>(0);
+  const [fileReadProgress, setFileReadProgress] = useState<number>(0);
+
   const [scanningTb, setScanningTb] = useState<boolean>(false);
-  const [scanError, setScanError] = useState<string | null>(null);
+  const [scanProgress, setScanProgress] = useState<number>(0);
+  const [scanStageText, setScanStageText] = useState<string>("");
+  const [scanElapsedSec, setScanElapsedSec] = useState<number>(0);
+  const [scanError, setScanError] = useState<{ error: string; hint?: string } | null>(null);
+  const [scanSuccessMsg, setScanSuccessMsg] = useState<string | null>(null);
   const [selectedTbView, setSelectedTbView] = useState<TextbookMaterial | null>(
     textbooks[0] || null
   );
 
-  // 2. AI Exam Generator State
+  // 2. AI Exam Generator State + Dynamic Categories from Scanned Textbook OCR
   const [genTextbookId, setGenTextbookId] = useState<string>(textbooks[0]?.id || "");
   const [genLevel, setGenLevel] = useState<QuestionLevel>("basic");
-  const [genCount, setGenCount] = useState<number>(5);
-  const [genCategories, setGenCategories] = useState<string[]>([
-    "Nhận biết hình và đếm cạnh/đỉnh",
-    "Tính chu vi hình chữ nhật, hình vuông, tam giác",
-    "Tính diện tích hình chữ nhật, hình vuông, hình ghép",
-  ]);
+  const [genCount, setGenCount] = useState<number>(10);
+  const [genCategories, setGenCategories] = useState<string[]>([]);
+  const [customCategoryInput, setCustomCategoryInput] = useState<string>("");
   const [useWeakTopics, setUseWeakTopics] = useState<boolean>(false);
   const [generatingExam, setGeneratingExam] = useState<boolean>(false);
-  const [genMessage, setGenMessage] = useState<string | null>(null);
+  const [genProgress, setGenProgress] = useState<number>(0);
+  const [genStageText, setGenStageText] = useState<string>("");
+  const [genElapsedSec, setGenElapsedSec] = useState<number>(0);
+  const [genError, setGenError] = useState<{ error: string; hint?: string } | null>(null);
+  const [genSuccessMessage, setGenSuccessMessage] = useState<string | null>(null);
+
+  // Selected textbook for AI Exam Generator
+  const currentSelectedTextbook = useMemo(
+    () => textbooks.find((t) => t.id === genTextbookId) || textbooks[0] || null,
+    [textbooks, genTextbookId]
+  );
+
+  // Dynamically build the available categories/rules/concepts directly from the scanned textbook JSON!
+  const dynamicTextbookCategories = useMemo(() => {
+    if (!currentSelectedTextbook) return [];
+    const items = new Set<string>();
+
+    // 1. Pull all Formulas / Rules extracted by OCR from this textbook
+    currentSelectedTextbook.formulasOrRules?.forEach((rule) => {
+      if (rule && rule.trim()) items.add(rule.trim());
+    });
+
+    // 2. Pull Key Concepts extracted by OCR from this textbook
+    currentSelectedTextbook.keyConcepts?.forEach((concept) => {
+      if (concept && concept.trim()) items.add(concept.trim());
+    });
+
+    // 3. Pull Sample Exercise Topic Tags extracted by OCR
+    currentSelectedTextbook.sampleExercises?.forEach((ex) => {
+      if (ex.topicTag && ex.topicTag.trim()) items.add(ex.topicTag.trim());
+    });
+
+    // 4. Add subject-appropriate question formats
+    items.add("Dạng: Trắc nghiệm 4 đáp án");
+    items.add("Dạng: Điền từ / Điền kết quả vào chỗ trống");
+    if (
+      currentSelectedTextbook.subject === "vietnamese" ||
+      currentSelectedTextbook.subject === "english"
+    ) {
+      items.add("Dạng: Sắp xếp các từ thành câu hoàn chỉnh");
+    }
+    if (currentSelectedTextbook.subject === "english") {
+      items.add("Dạng: Nghe phát âm Tiếng Anh và chọn/điền đáp án");
+    }
+    if (currentSelectedTextbook.subject === "math") {
+      items.add("Dạng: Toán có hình vẽ minh họa trực quan (SVG)");
+    }
+
+    return Array.from(items);
+  }, [currentSelectedTextbook]);
+
+  // Whenever the teacher switches to a different textbook, automatically select its scanned rules & concepts!
+  useEffect(() => {
+    if (dynamicTextbookCategories.length > 0) {
+      setGenCategories(dynamicTextbookCategories);
+    }
+  }, [dynamicTextbookCategories]);
 
   // 3. Review Queue Inline Edit State
   const [editingQuestionId, setEditingQuestionId] = useState<string | null>(null);
@@ -120,30 +225,121 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
   const [bankSubjectFilter, setBankSubjectFilter] = useState<SubjectId | "all">("all");
 
   const pendingQuestions = questions.filter((q) => q.status === "pending_review");
-  const approvedQuestions = questions.filter((q) => q.status === "approved");
+  const uncompletedApprovedQuestions = questions.filter(
+    (q) => q.status === "approved" && !q.completedByChildIds?.includes(activeChildId)
+  );
+  const completedApprovedQuestions = questions.filter(
+    (q) => q.status === "approved" && q.completedByChildIds?.includes(activeChildId)
+  );
 
   const weakTopicSummary = Array.from(
     new Set(mistakes.filter((m) => !m.resolved).map((m) => m.topic))
   );
 
+  // Timer & simulated stage progression during OCR Textbook Scan
+  useEffect(() => {
+    if (!scanningTb) return;
+    setScanElapsedSec(0);
+    setScanProgress(12);
+    setScanStageText("Bước 1/4: Đang chuẩn bị dữ liệu trang sách & mã hóa hình ảnh...");
+
+    const interval = setInterval(() => {
+      setScanElapsedSec((prev) => {
+        const next = prev + 1;
+        if (next === 2) {
+          setScanProgress(38);
+          setScanStageText(
+            `Bước 2/4: Model ${selectedModel} đang quét nhận diện chữ viết & ký hiệu (OCR)...`
+          );
+        } else if (next === 5) {
+          setScanProgress(68);
+          setScanStageText(
+            "Bước 3/4: Đang bóc tách công thức, quy tắc và bài tập mẫu sang cấu trúc JSON..."
+          );
+        } else if (next >= 8) {
+          setScanProgress((p) => Math.min(92, p + 3));
+          setScanStageText(
+            "Bước 4/4: Đang kiểm tra tính toàn vẹn dữ liệu JSON trước khi lưu vào kho..."
+          );
+        }
+        return next;
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [scanningTb, selectedModel]);
+
+  // Elapsed timer during AI Exam Generation
+  useEffect(() => {
+    if (!generatingExam) return;
+    setGenElapsedSec(0);
+    const interval = setInterval(() => {
+      setGenElapsedSec((prev) => prev + 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [generatingExam]);
+
+  const handleCheckModelStatus = async (modelToTest = selectedModel) => {
+    setCheckingKey(true);
+    setKeyStatusResult(null);
+    try {
+      const res = await fetch("/api/ai/check-status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: modelToTest }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setKeyStatusResult({
+          ok: false,
+          message: data.error || "Không thể kết nối tới model AI.",
+          hint: data.hint,
+        });
+      } else {
+        setKeyStatusResult({
+          ok: true,
+          message: `Kết nối thành công tới '${data.modelUsed}' (Phản hồi trong ${data.latencyMs}ms). API Key hoạt động tốt!`,
+        });
+      }
+    } catch (err: unknown) {
+      setKeyStatusResult({
+        ok: false,
+        message: err instanceof Error ? err.message : "Lỗi mạng khi kiểm tra kết nối AI.",
+      });
+    } finally {
+      setCheckingKey(false);
+    }
+  };
+
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setTbFileName(file.name);
+    setTbFileSizeKb(Math.max(1, Math.round(file.size / 1024)));
+    setFileReadProgress(10);
+    setScanError(null);
+    setScanSuccessMsg(null);
+
+    const reader = new FileReader();
+    reader.onprogress = (ev) => {
+      if (ev.lengthComputable) {
+        setFileReadProgress(Math.round((ev.loaded / ev.total) * 100));
+      }
+    };
 
     if (file.type === "text/plain" || file.name.endsWith(".txt") || file.name.endsWith(".md")) {
-      const reader = new FileReader();
       reader.onload = () => {
         setTbRawText(String(reader.result || ""));
+        setFileReadProgress(100);
       };
       reader.readAsText(file);
     } else {
-      const reader = new FileReader();
       reader.onload = () => {
         const resultStr = String(reader.result || "");
         const base64Part = resultStr.split(",")[1] || "";
         setTbImageBase64(base64Part);
         setTbMimeType(file.type || "image/png");
+        setFileReadProgress(100);
       };
       reader.readAsDataURL(file);
     }
@@ -151,18 +347,22 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
 
   const handleScanTextbook = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!tbTitle.trim() && !tbFileName) {
-      setScanError("Vui lòng nhập tên bài học hoặc tải lên trang sách giáo khoa.");
+    if (!tbTitle.trim() && !tbFileName && !tbRawText.trim()) {
+      setScanError({
+        error: "Vui lòng nhập tên bài học, dán văn bản hoặc tải lên ảnh/PDF trang sách giáo khoa.",
+      });
       return;
     }
     setScanningTb(true);
     setScanError(null);
+    setScanSuccessMsg(null);
 
     try {
       const res = await fetch("/api/ai/scan-textbook", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          model: selectedModel,
           title: tbTitle.trim() || tbFileName,
           subject: tbSubject,
           grade: tbGrade,
@@ -171,33 +371,60 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
           mimeType: tbMimeType || undefined,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Lỗi khi quét sách giáo khoa.");
+
+      let data: Record<string, unknown> = {};
+      try {
+        data = await res.json();
+      } catch {
+        throw new Error(
+          `Máy chủ trả về phản hồi không phải JSON (Mã HTTP ${res.status}). Hãy thử chọn model nhẹ hơn như gemini-3.1-flash-lite.`
+        );
       }
+
+      if (!res.ok) {
+        setScanError({
+          error: String(data.error || "Lỗi khi quét sách giáo khoa."),
+          hint: data.hint ? String(data.hint) : undefined,
+        });
+        return;
+      }
+
+      setScanProgress(100);
+      setScanStageText("Hoàn tất 100%! Đã bóc tách thành công sang định dạng Text & JSON.");
 
       const newTb: TextbookMaterial = {
         id: `tb-${Date.now()}`,
         title: tbTitle.trim() || tbFileName || "Bài học sách giáo khoa",
         subject: tbSubject,
         grade: tbGrade,
-        extractedText: data.extractedText || tbRawText,
-        summary: data.summary || "",
-        keyConcepts: data.keyConcepts || [],
-        formulasOrRules: data.formulasOrRules || [],
-        sampleExercises: data.sampleExercises || [],
+        extractedText: String(data.extractedText || tbRawText),
+        summary: String(data.summary || ""),
+        keyConcepts: Array.isArray(data.keyConcepts) ? (data.keyConcepts as string[]) : [],
+        formulasOrRules: Array.isArray(data.formulasOrRules)
+          ? (data.formulasOrRules as string[])
+          : [],
+        sampleExercises: Array.isArray(data.sampleExercises)
+          ? (data.sampleExercises as TextbookMaterial["sampleExercises"])
+          : [],
         createdAt: new Date().toISOString(),
       };
 
       onAddTextbook(newTb);
       setSelectedTbView(newTb);
       setGenTextbookId(newTb.id);
+      setScanSuccessMsg(
+        `Đã quét OCR và lưu thành công bài "${newTb.title}" bằng model ${selectedModel}! Các công thức/quy tắc đã tự động nạp sang phần Tạo đề.`
+      );
       setTbTitle("");
       setTbRawText("");
       setTbImageBase64("");
       setTbFileName("");
+      setFileReadProgress(0);
     } catch (err: unknown) {
-      setScanError(err instanceof Error ? err.message : "Không thể quét tài liệu.");
+      setScanError({
+        error: err instanceof Error ? err.message : "Không thể quét tài liệu.",
+        hint: "Hãy thử đổi sang model 'gemini-3.8-flash' hoặc bấm nút 'Kiểm tra Model & Key' ở phía trên.",
+      });
     } finally {
       setScanningTb(false);
     }
@@ -205,81 +432,145 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
 
   const handleGenerateAiExam = async (e: React.FormEvent) => {
     e.preventDefault();
-    const targetTb = textbooks.find((t) => t.id === genTextbookId) || textbooks[0];
+    const targetTb = currentSelectedTextbook;
+    const totalRequested = Math.max(1, Math.min(100, genCount));
+    const batchSize = 8;
+    const totalBatches = Math.ceil(totalRequested / batchSize);
+
     setGeneratingExam(true);
-    setGenMessage(null);
+    setGenError(null);
+    setGenSuccessMessage(null);
+    setGenProgress(10);
+
+    let totalGeneratedCount = 0;
 
     try {
-      const res = await fetch("/api/ai/generate-exam", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          subject: targetTb ? SUBJECT_META[targetTb.subject].label : "Toán",
-          grade: targetTb?.grade || grade,
-          level: genLevel,
-          count: genCount,
-          textbookContent: targetTb
-            ? {
-                title: targetTb.title,
-                extractedText: targetTb.extractedText,
-                formulasOrRules: targetTb.formulasOrRules,
-                sampleExercises: targetTb.sampleExercises,
-              }
-            : {},
-          preferredCategories: genCategories,
-          weakTopics: useWeakTopics ? weakTopicSummary : [],
-        }),
-      });
+      for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+        const currentBatchCount = Math.min(
+          batchSize,
+          totalRequested - batchIndex * batchSize
+        );
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Không thể tạo đề bằng AI.");
+        setGenStageText(
+          totalBatches > 1
+            ? `Đang tạo đợt ${batchIndex + 1}/${totalBatches} (${currentBatchCount} câu) — Đã xong ${totalGeneratedCount}/${totalRequested} câu...`
+            : `Model ${selectedModel} đang thiết kế ${currentBatchCount} câu hỏi sát theo dữ liệu SGK...`
+        );
+
+        const res = await fetch("/api/ai/generate-exam", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: selectedModel,
+            subject: targetTb ? SUBJECT_META[targetTb.subject].label : "Toán",
+            subjectId: targetTb?.subject || "math",
+            grade: targetTb?.grade || grade,
+            level: genLevel,
+            count: currentBatchCount,
+            textbookContent: targetTb
+              ? {
+                  title: targetTb.title,
+                  extractedText: targetTb.extractedText,
+                  keyConcepts: targetTb.keyConcepts,
+                  formulasOrRules: targetTb.formulasOrRules,
+                  sampleExercises: targetTb.sampleExercises,
+                }
+              : {},
+            preferredCategories: genCategories,
+            weakTopics: useWeakTopics ? weakTopicSummary : [],
+          }),
+        });
+
+        let data: Record<string, unknown> = {};
+        try {
+          data = await res.json();
+        } catch {
+          throw new Error(
+            `Máy chủ không phản hồi đúng định dạng JSON ở đợt ${batchIndex + 1} (HTTP ${res.status}).`
+          );
+        }
+
+        if (!res.ok) {
+          setGenError({
+            error: String(data.error || "Không thể tạo đề bằng AI."),
+            hint: data.hint ? String(data.hint) : undefined,
+          });
+          return;
+        }
+
+        const rawList = Array.isArray(data.questions) ? data.questions : [];
+        if (rawList.length > 0) {
+          const createdItems: QuestionItem[] = rawList.map(
+            (item: Partial<QuestionItem> & { geometrySpec?: GeometrySpec }, idx: number) => ({
+              id: `q-ai-${Date.now()}-${batchIndex}-${idx}`,
+              subject: targetTb?.subject || "math",
+              grade: targetTb?.grade || grade,
+              topic: item.topic || "Kiến thức trọng tâm",
+              level: genLevel,
+              type: (item.type as QuestionType) || "multiple_choice",
+              status: "pending_review",
+              questionText: item.questionText || "",
+              audioText: item.audioText || undefined,
+              options: Array.isArray(item.options) ? item.options : [],
+              correctAnswer: String(item.correctAnswer || ""),
+              explanation: item.explanation || "",
+              geometrySpec:
+                item.geometrySpec &&
+                (item.geometrySpec.hasGeometry || item.type === "geometry_visual")
+                  ? {
+                      hasGeometry: true,
+                      shapeType: (item.geometrySpec.shapeType as ShapeType) || "rectangle",
+                      width: item.geometrySpec.width || 8,
+                      height: item.geometrySpec.height || 5,
+                      topWidth: item.geometrySpec.topWidth || 4,
+                      sideA: item.geometrySpec.sideA || 6,
+                      sideB: item.geometrySpec.sideB || 8,
+                      sideC: item.geometrySpec.sideC || 10,
+                      unit: item.geometrySpec.unit || "cm",
+                      showGrid: item.geometrySpec.showGrid ?? true,
+                      taskFocus: item.geometrySpec.taskFocus || "perimeter",
+                      customLabel: item.geometrySpec.customLabel || item.topic,
+                    }
+                  : undefined,
+              sourceTextbookId: targetTb?.id,
+              completedByChildIds: [],
+              createdAt: new Date().toISOString(),
+            })
+          );
+
+          onAddQuestions(createdItems);
+          totalGeneratedCount += createdItems.length;
+        }
+
+        const progressPct = Math.min(
+          98,
+          Math.round(((batchIndex + 1) / totalBatches) * 100)
+        );
+        setGenProgress(progressPct);
       }
 
-      const rawList = Array.isArray(data.questions) ? data.questions : [];
-      const createdItems: QuestionItem[] = rawList.map(
-        (item: Partial<QuestionItem> & { geometrySpec?: GeometrySpec }, idx: number) => ({
-          id: `q-ai-${Date.now()}-${idx}`,
-          subject: targetTb?.subject || "math",
-          grade: targetTb?.grade || grade,
-          topic: item.topic || "Kiến thức trọng tâm",
-          level: genLevel,
-          type: (item.type as QuestionType) || "multiple_choice",
-          status: "pending_review", // Always requires manual approval first!
-          questionText: item.questionText || "",
-          audioText: item.audioText || undefined,
-          options: Array.isArray(item.options) ? item.options : [],
-          correctAnswer: String(item.correctAnswer || ""),
-          explanation: item.explanation || "",
-          geometrySpec:
-            item.geometrySpec && (item.geometrySpec.hasGeometry || item.type === "geometry_visual")
-              ? {
-                  hasGeometry: true,
-                  shapeType: (item.geometrySpec.shapeType as ShapeType) || "rectangle",
-                  width: item.geometrySpec.width || 8,
-                  height: item.geometrySpec.height || 5,
-                  topWidth: item.geometrySpec.topWidth || 4,
-                  sideA: item.geometrySpec.sideA || 6,
-                  sideB: item.geometrySpec.sideB || 8,
-                  sideC: item.geometrySpec.sideC || 10,
-                  unit: item.geometrySpec.unit || "cm",
-                  showGrid: item.geometrySpec.showGrid ?? true,
-                  taskFocus: item.geometrySpec.taskFocus || "perimeter",
-                  customLabel: item.geometrySpec.customLabel || item.topic,
-                }
-              : undefined,
-          sourceTextbookId: targetTb?.id,
-          createdAt: new Date().toISOString(),
-        })
-      );
+      if (totalGeneratedCount === 0) {
+        setGenError({
+          error: `Model '${selectedModel}' không sinh được câu hỏi nào (0 câu).`,
+          hint: "Bạn hãy thử đổi sang model 'gemini-3.8-flash' hoặc 'gemini-flash-latest' rồi bấm tạo lại nhé.",
+        });
+        return;
+      }
 
-      onAddQuestions(createdItems);
-      setGenMessage(
-        `AI đã sinh ${createdItems.length} câu hỏi mới và đưa vào Hàng Đợi Duyệt Tay. Bạn hãy kiểm tra trước khi cho bé làm nhé!`
+      setGenProgress(100);
+      setGenStageText(`Hoàn tất 100%! Đã tạo xong ${totalGeneratedCount} câu hỏi.`);
+      setGenSuccessMessage(
+        `Thành công! Model '${selectedModel}' đã sinh ${totalGeneratedCount} câu hỏi mới và đưa vào Hàng Đợi Duyệt Tay. Bạn hãy kiểm tra và bấm Duyệt nhé!`
       );
       setActiveSubTab("review_queue");
     } catch (err: unknown) {
-      setGenMessage(err instanceof Error ? err.message : "Lỗi khi gọi AI ra đề.");
+      setGenError({
+        error: err instanceof Error ? err.message : "Lỗi không xác định khi gọi AI ra đề.",
+        hint:
+          totalGeneratedCount > 0
+            ? `Đã lưu được ${totalGeneratedCount} câu hỏi của các đợt trước vào Hàng Đợi Duyệt Tay.`
+            : "Hãy bấm nút 'Kiểm tra Model & Key' hoặc đổi sang model 'gemini-3.8-flash' rồi thử lại.",
+      });
     } finally {
       setGeneratingExam(false);
     }
@@ -289,6 +580,15 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
     setGenCategories((prev) =>
       prev.includes(cat) ? prev.filter((c) => c !== cat) : [...prev, cat]
     );
+  };
+
+  const handleAddCustomCategory = () => {
+    const val = customCategoryInput.trim();
+    if (!val) return;
+    if (!genCategories.includes(val)) {
+      setGenCategories((prev) => [...prev, val]);
+    }
+    setCustomCategoryInput("");
   };
 
   const handleManualSubmit = (e: React.FormEvent) => {
@@ -328,6 +628,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
             customLabel: mTopic,
           }
         : undefined,
+      completedByChildIds: [],
       createdAt: new Date().toISOString(),
     };
 
@@ -340,37 +641,106 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* Header & Backup Controls */}
-      <div className="rounded-xl border border-slate-200 bg-white p-6 flex flex-wrap items-center justify-between gap-4">
-        <div className="space-y-1">
-          <h1 className="text-xl font-bold text-slate-900">
-            Phòng Giáo Viên &amp; Phụ Huynh — Quản Lý SGK &amp; Duyệt Đề AI
-          </h1>
-          <p className="text-xs text-slate-500">
-            Tải sách giáo khoa sang dạng Text/JSON, yêu cầu AI ra đề 2 mức Cơ bản / Nâng cao và duyệt tay trước khi đưa vào ngân hàng câu hỏi của bé
-          </p>
+      {/* Header, AI Model Selector & Backup Controls */}
+      <div className="rounded-xl border border-slate-200 bg-white p-6 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="space-y-1">
+            <h1 className="text-xl font-bold text-slate-900">
+              Phòng Giáo Viên &amp; Phụ Huynh — Quản Lý SGK &amp; Duyệt Đề AI
+            </h1>
+            <p className="text-xs text-slate-500">
+              Tải sách giáo khoa sang dạng Text/JSON, tạo số lượng câu hỏi tùy ý chờ sẵn và quản lý kho đề Chưa làm / Đã làm của {activeChildName}
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onExportBackup}
+              className="px-3.5 py-2 rounded-lg border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0"
+            >
+              Xuất file Sao lưu (.json)
+            </button>
+            <label className="px-3.5 py-2 rounded-lg border border-sky-200 bg-sky-50 text-xs font-semibold text-sky-700 hover:bg-sky-100 cursor-pointer transition-colors whitespace-nowrap shrink-0">
+              <span>Nhập file Sao lưu</span>
+              <input
+                type="file"
+                accept=".json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) onImportBackup(file);
+                }}
+              />
+            </label>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onExportBackup}
-            className="px-3.5 py-2 rounded-lg border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0"
-          >
-            Xuất file Sao lưu (.json)
-          </button>
-          <label className="px-3.5 py-2 rounded-lg border border-sky-200 bg-sky-50 text-xs font-semibold text-sky-700 hover:bg-sky-100 cursor-pointer transition-colors whitespace-nowrap shrink-0">
-            <span>Nhập file Sao lưu</span>
-            <input
-              type="file"
-              accept=".json"
-              className="hidden"
+        {/* Global AI Model Selector & API Key Health Checker */}
+        <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex flex-wrap items-center gap-3 flex-1 min-w-[280px]">
+            <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800 whitespace-nowrap">
+              <Cpu className="w-4 h-4 text-sky-600" />
+              <span>Chọn Model AI (Quét SGK &amp; Ra đề):</span>
+            </div>
+            <select
+              value={selectedModel}
               onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) onImportBackup(file);
+                setSelectedModel(e.target.value);
+                setKeyStatusResult(null);
               }}
-            />
-          </label>
+              className="flex-1 min-w-[240px] max-w-md px-3 py-2 text-xs font-semibold rounded-lg border border-slate-300 bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500"
+            >
+              {AI_MODEL_OPTIONS.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={checkingKey}
+              onClick={() => handleCheckModelStatus(selectedModel)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
+            >
+              {checkingKey ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Đang kiểm tra Key &amp; Model...</span>
+                </>
+              ) : (
+                <>
+                  <Activity className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Kiểm tra Model &amp; API Key</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {keyStatusResult && (
+            <div
+              className={`w-full p-3 rounded-lg border text-xs flex flex-col gap-1 ${
+                keyStatusResult.ok
+                  ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+                  : "bg-rose-50 border-rose-300 text-rose-900"
+              }`}
+            >
+              <div className="font-bold flex items-center gap-1.5">
+                {keyStatusResult.ok ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                ) : (
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                )}
+                <span>{keyStatusResult.message}</span>
+              </div>
+              {keyStatusResult.hint && (
+                <div className="text-rose-700 pl-5">{keyStatusResult.hint}</div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -379,67 +749,81 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
         <button
           type="button"
           onClick={() => setActiveSubTab("review_queue")}
-          className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+          className={`px-3.5 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
             activeSubTab === "review_queue"
               ? "bg-white text-slate-900 shadow-xs"
               : "text-slate-600 hover:text-slate-900"
           }`}
         >
-          1. Duyệt Đề AI ({pendingQuestions.length} câu chờ duyệt)
+          1. Duyệt Đề AI ({pendingQuestions.length} chờ duyệt)
         </button>
         <button
           type="button"
           onClick={() => setActiveSubTab("ai_generator")}
-          className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+          className={`px-3.5 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
             activeSubTab === "ai_generator"
               ? "bg-white text-slate-900 shadow-xs"
               : "text-slate-600 hover:text-slate-900"
           }`}
         >
-          2. Yêu Cầu AI Ra Đề (Cơ bản &amp; Nâng cao)
+          2. Yêu Cầu AI Ra Đề (Số câu tùy ý)
         </button>
         <button
           type="button"
           onClick={() => setActiveSubTab("textbooks")}
-          className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+          className={`px-3.5 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
             activeSubTab === "textbooks"
               ? "bg-white text-slate-900 shadow-xs"
               : "text-slate-600 hover:text-slate-900"
           }`}
         >
-          3. Kho Sách Giáo Khoa ({textbooks.length} tài liệu JSON)
+          3. Kho Sách Giáo Khoa ({textbooks.length})
         </button>
         <button
           type="button"
           onClick={() => setActiveSubTab("manual_create")}
-          className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+          className={`px-3.5 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
             activeSubTab === "manual_create"
               ? "bg-white text-slate-900 shadow-xs"
               : "text-slate-600 hover:text-slate-900"
           }`}
         >
-          4. Tự Tạo Câu Hỏi &amp; Hình Học
+          4. Tự Tạo Câu Hỏi
         </button>
         <button
           type="button"
           onClick={() => setActiveSubTab("approved_bank")}
-          className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+          className={`px-3.5 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
             activeSubTab === "approved_bank"
               ? "bg-white text-slate-900 shadow-xs"
               : "text-slate-600 hover:text-slate-900"
           }`}
         >
-          5. Ngân Hàng Đề Đã Duyệt ({approvedQuestions.length})
+          5. Đã Duyệt Chờ Bé Làm ({uncompletedApprovedQuestions.length})
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveSubTab("completed_bank")}
+          className={`px-3.5 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+            activeSubTab === "completed_bank"
+              ? "bg-white text-slate-900 shadow-xs"
+              : "text-slate-600 hover:text-slate-900"
+          }`}
+        >
+          6. Mục Bé Đã Làm Xong ({completedApprovedQuestions.length})
         </button>
       </div>
 
-      {genMessage && (
-        <div className="p-4 rounded-xl bg-sky-50 border border-sky-200 text-xs font-medium text-sky-900 flex items-center justify-between">
-          <span>{genMessage}</span>
+      {genSuccessMessage && (
+        <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-950 flex items-center justify-between">
+          <span className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            {genSuccessMessage}
+          </span>
           <button
             type="button"
-            onClick={() => setGenMessage(null)}
-            className="text-sky-700 underline ml-4"
+            onClick={() => setGenSuccessMessage(null)}
+            className="text-emerald-700 underline ml-4"
           >
             Đóng
           </button>
@@ -487,7 +871,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                 Tất cả câu hỏi đều đã được duyệt xong!
               </div>
               <p className="text-xs text-slate-500 max-w-md mx-auto">
-                Bạn có thể sang mục "Yêu Cầu AI Ra Đề" để tạo thêm bài tập từ sách giáo khoa hoặc từ các chủ đề con đang làm sai.
+                Bạn có thể sang mục "Yêu Cầu AI Ra Đề" để tạo sẵn 20–50 câu hỏi mới từ sách giáo khoa cho bé làm dần mỗi ngày.
               </p>
             </div>
           ) : (
@@ -629,10 +1013,18 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
                         <div
                           className={
-                            item.geometrySpec?.hasGeometry ? "lg:col-span-7 space-y-3" : "lg:col-span-12 space-y-3"
+                            item.geometrySpec?.hasGeometry
+                              ? "lg:col-span-7 space-y-3"
+                              : "lg:col-span-12 space-y-3"
                           }
                         >
                           <p className="text-base font-bold text-slate-900">{item.questionText}</p>
+                          {item.audioText && (
+                            <div className="text-xs text-amber-800 bg-amber-50 px-3 py-1.5 rounded-lg border border-amber-200">
+                              🔊 Nội dung phát âm (sẽ ẩn chữ khi bé làm bài):{" "}
+                              <strong>“{item.audioText}”</strong>
+                            </div>
+                          )}
                           {item.options.length > 0 && (
                             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                               {item.options.map((opt, i) => (
@@ -652,7 +1044,9 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                           <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-700 space-y-1">
                             <div>
                               <span className="font-bold text-emerald-700">Đáp án đúng: </span>
-                              <span className="font-mono-tabular font-bold">{item.correctAnswer}</span>
+                              <span className="font-mono-tabular font-bold">
+                                {item.correctAnswer}
+                              </span>
                             </div>
                             <div>
                               <span className="font-semibold text-slate-700">Lời giải: </span>
@@ -688,31 +1082,50 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                 Trình Tạo Đề AI Từ Dữ Liệu Sách Giáo Khoa Đã Lưu
               </h2>
               <p className="text-xs text-slate-500">
-                AI sẽ lấy trực tiếp kiến thức, công thức và bài mẫu từ sách giáo khoa JSON để sinh đề rồi chuyển sang Hàng Đợi Duyệt Tay
+                Các công thức, quy tắc và dạng bài ở Mục 5 bên dưới được tự động lấy trực tiếp từ dữ liệu OCR của bài sách giáo khoa bạn chọn
               </p>
-            </div>
-
-            <div>
-              <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                1. Chọn tài liệu Sách Giáo Khoa nguồn:
-              </label>
-              <select
-                value={genTextbookId}
-                onChange={(e) => setGenTextbookId(e.target.value)}
-                className="w-full px-3.5 py-2.5 text-sm rounded-lg border border-slate-200 bg-white font-medium"
-              >
-                {textbooks.map((tb) => (
-                  <option key={tb.id} value={tb.id}>
-                    [{SUBJECT_META[tb.subject].shortLabel} - Lớp {tb.grade}] {tb.title}
-                  </option>
-                ))}
-              </select>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                  2. Chọn mức độ ra đề:
+                  1. Chọn tài liệu Sách Giáo Khoa nguồn:
+                </label>
+                <select
+                  value={genTextbookId}
+                  onChange={(e) => setGenTextbookId(e.target.value)}
+                  className="w-full px-3.5 py-2.5 text-xs rounded-lg border border-slate-200 bg-white font-semibold"
+                >
+                  {textbooks.map((tb) => (
+                    <option key={tb.id} value={tb.id}>
+                      [{SUBJECT_META[tb.subject].shortLabel} - Lớp {tb.grade}] {tb.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                  2. Model AI dùng để thiết kế đề:
+                </label>
+                <select
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                  className="w-full px-3.5 py-2.5 text-xs rounded-lg border border-sky-300 bg-sky-50/50 font-semibold text-sky-950"
+                >
+                  {AI_MODEL_OPTIONS.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                  3. Chọn mức độ ra đề:
                 </label>
                 <div className="space-y-2">
                   <label
@@ -732,7 +1145,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                     <div className="text-xs">
                       <div className="font-bold text-slate-900">Mức Cơ Bản (Biến đổi số liệu)</div>
                       <div className="text-slate-500">
-                        Giữ nguyên dạng bài trong SGK, chỉ thay đổi số đo cạnh, con số, tên gọi
+                        Giữ nguyên dạng bài trong SGK, chỉ thay đổi số liệu, từ vựng, ngữ cảnh
                       </div>
                     </div>
                   </label>
@@ -754,7 +1167,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                     <div className="text-xs">
                       <div className="font-bold text-slate-900">Mức Nâng Cao (Mở rộng tư duy)</div>
                       <div className="text-slate-500">
-                        Bài toán nhiều bước, ghép hình, tìm cạnh ngược từ chu vi/diện tích trong phạm vi đã học
+                        Bài tập vận dụng sâu, suy luận 2 bước trong phạm vi kiến thức đã học
                       </div>
                     </div>
                   </label>
@@ -764,23 +1177,37 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               <div className="space-y-4">
                 <div>
                   <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                    3. Số lượng câu hỏi muốn tạo:
+                    4. Số lượng câu hỏi muốn tạo (Chọn nhanh hoặc nhập tùy ý):
                   </label>
-                  <div className="flex items-center gap-2">
-                    {[3, 5, 8, 10].map((num) => (
+                  <div className="flex flex-wrap items-center gap-1.5 mb-2">
+                    {[5, 10, 15, 20, 30, 50].map((num) => (
                       <button
                         key={num}
                         type="button"
                         onClick={() => setGenCount(num)}
-                        className={`px-3.5 py-2 rounded-lg text-xs font-bold font-mono-tabular border ${
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold font-mono-tabular border ${
                           genCount === num
                             ? "bg-sky-600 text-white border-sky-600"
                             : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
                         }`}
                       >
-                        {num} câu
+                        {num}
                       </button>
                     ))}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-slate-600">Nhập số câu tùy ý:</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={genCount}
+                      onChange={(e) =>
+                        setGenCount(Math.max(1, Math.min(100, Number(e.target.value) || 1)))
+                      }
+                      className="w-24 px-3 py-1.5 text-xs font-bold font-mono-tabular rounded-lg border border-slate-300 bg-white"
+                    />
+                    <span className="text-xs text-slate-500">câu (Tối đa 100 câu/lần)</span>
                   </div>
                 </div>
 
@@ -802,31 +1229,138 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               </div>
             </div>
 
-            <div>
-              <label className="block text-xs font-bold text-slate-700 mb-2">
-                4. Các dạng bài ưu tiên đưa vào đề (Bấm để chọn/bỏ chọn):
-              </label>
+            {/* Step 5: Dynamic Categories Extracted Directly from Selected Textbook's OCR Data */}
+            <div className="space-y-2.5 p-4 rounded-xl bg-slate-50 border border-slate-200">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <label className="text-xs font-bold text-slate-800">
+                  5. Công thức, Quy tắc &amp; Dạng bài trích từ bài học “{currentSelectedTextbook?.title}”:
+                </label>
+                <div className="flex items-center gap-2 text-[11px]">
+                  <button
+                    type="button"
+                    onClick={() => setGenCategories(dynamicTextbookCategories)}
+                    className="text-sky-700 font-semibold hover:underline"
+                  >
+                    Chọn tất cả
+                  </button>
+                  <span className="text-slate-300">·</span>
+                  <button
+                    type="button"
+                    onClick={() => setGenCategories([])}
+                    className="text-slate-500 hover:underline"
+                  >
+                    Bỏ chọn hết
+                  </button>
+                </div>
+              </div>
+
               <div className="flex flex-wrap gap-2">
-                {GEOMETRY_CATEGORIES.map((cat) => {
-                  const active = genCategories.includes(cat);
-                  return (
-                    <button
-                      key={cat}
-                      type="button"
-                      onClick={() => handleToggleCategory(cat)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                        active
-                          ? "bg-sky-50 border-sky-300 text-sky-900 font-semibold"
-                          : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
-                      }`}
-                    >
-                      {active ? "✓ " : "+ "}
-                      {cat}
-                    </button>
-                  );
-                })}
+                {Array.from(new Set([...dynamicTextbookCategories, ...genCategories])).map(
+                  (cat) => {
+                    const active = genCategories.includes(cat);
+                    return (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => handleToggleCategory(cat)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium border text-left transition-colors ${
+                          active
+                            ? "bg-sky-600 border-sky-600 text-white font-semibold"
+                            : "bg-white border-slate-200 text-slate-700 hover:bg-slate-100"
+                        }`}
+                      >
+                        {active ? "✓ " : "+ "}
+                        {cat}
+                      </button>
+                    );
+                  }
+                )}
+              </div>
+
+              {/* Allow adding any custom requirement */}
+              <div className="pt-2 flex items-center gap-2">
+                <input
+                  type="text"
+                  value={customCategoryInput}
+                  onChange={(e) => setCustomCategoryInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleAddCustomCategory();
+                    }
+                  }}
+                  placeholder="Thêm yêu cầu dạng bài riêng (VD: Tìm từ láy, Đặt câu hỏi When/Where...)"
+                  className="flex-1 px-3 py-1.5 text-xs rounded-lg border border-slate-200 bg-white"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddCustomCategory}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 text-white text-xs font-semibold hover:bg-slate-700 whitespace-nowrap shrink-0"
+                >
+                  + Thêm dạng này
+                </button>
               </div>
             </div>
+
+            {/* Visual Step-by-Step Progress Bar during Exam Generation */}
+            {generatingExam && (
+              <div className="p-4 rounded-xl bg-sky-50 border border-sky-200 space-y-2.5">
+                <div className="flex items-center justify-between text-xs font-bold text-sky-900">
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin text-sky-600 shrink-0" />
+                    <span>{genStageText}</span>
+                  </span>
+                  <span className="font-mono-tabular shrink-0 ml-2">
+                    {genProgress}% · {genElapsedSec}s
+                  </span>
+                </div>
+                <div className="w-full h-2.5 bg-sky-100 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-sky-600 transition-all duration-500"
+                    style={{ width: `${genProgress}%` }}
+                  />
+                </div>
+                <div className="text-[11px] text-sky-700">
+                  Khi tạo số lượng câu lớn (trên 8 câu), hệ thống tự động chia thành các đợt 8 câu để không bao giờ bị tràn bộ nhớ JSON.
+                </div>
+              </div>
+            )}
+
+            {/* Prominent Diagnostic Error Alert if AI Generation Fails */}
+            {genError && (
+              <div className="p-4 rounded-xl bg-rose-50 border-2 border-rose-300 space-y-2.5 text-xs">
+                <div className="flex items-start gap-2 font-bold text-rose-900">
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <span>{genError.error}</span>
+                </div>
+                {genError.hint && (
+                  <p className="text-rose-800 pl-6 leading-relaxed">{genError.hint}</p>
+                )}
+                <div className="pl-6 pt-1 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedModel("gemini-3.8-flash");
+                      setGenError(null);
+                    }}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white border border-rose-300 text-rose-800 font-semibold hover:bg-rose-100"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Đổi sang Gemini 3.8 Flash</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedModel("gemini-flash-latest");
+                      setGenError(null);
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-white border border-rose-300 text-rose-800 font-semibold hover:bg-rose-100"
+                  >
+                    Đổi sang Gemini Flash Latest
+                  </button>
+                </div>
+              </div>
+            )}
 
             <button
               type="submit"
@@ -836,12 +1370,14 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               {generatingExam ? (
                 <>
                   <Loader2 className="w-5 h-5 animate-spin" />
-                  <span>AI đang đọc dữ liệu SGK và thiết kế câu hỏi + hình vẽ...</span>
+                  <span>Đang tạo {genCount} câu bằng {selectedModel}...</span>
                 </>
               ) : (
                 <>
                   <Sparkles className="w-5 h-5" />
-                  <span>Bắt Đầu Tạo Đề &amp; Đưa Vào Hàng Đợi Duyệt Tay</span>
+                  <span>
+                    Bắt Đầu Tạo {genCount} Câu Hỏi ({selectedModel}) &amp; Đưa Vào Duyệt Tay
+                  </span>
                 </>
               )}
             </button>
@@ -853,36 +1389,42 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               <BookOpen className="w-4 h-4 text-sky-600" />
               <span>Dữ liệu SGK gốc đang chọn cho AI</span>
             </h3>
-            {(() => {
-              const currentTb = textbooks.find((t) => t.id === genTextbookId) || textbooks[0];
-              if (!currentTb) return null;
-              return (
-                <div className="space-y-3 text-xs">
-                  <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
-                    <div className="font-bold text-slate-900">{currentTb.title}</div>
-                    <p className="text-slate-600">{currentTb.summary}</p>
-                  </div>
-                  <div>
-                    <div className="font-bold text-slate-700 mb-1">
-                      Công thức &amp; Quy tắc trong bài:
-                    </div>
-                    <ul className="list-disc pl-4 space-y-1 text-slate-700">
-                      {currentTb.formulasOrRules.map((f, i) => (
-                        <li key={i}>{f}</li>
-                      ))}
-                    </ul>
-                  </div>
-                  <div>
-                    <div className="font-bold text-slate-700 mb-1">
-                      Văn bản đã quét (Text lưu trữ):
-                    </div>
-                    <pre className="p-3 rounded-lg bg-slate-900 text-slate-100 font-mono text-[11px] whitespace-pre-wrap max-h-48 overflow-y-auto">
-                      {currentTb.extractedText}
-                    </pre>
-                  </div>
+            {currentSelectedTextbook && (
+              <div className="space-y-3 text-xs">
+                <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+                  <div className="font-bold text-slate-900">{currentSelectedTextbook.title}</div>
+                  <p className="text-slate-600">{currentSelectedTextbook.summary}</p>
                 </div>
-              );
-            })()}
+                <div>
+                  <div className="font-bold text-slate-700 mb-1">
+                    Công thức &amp; Quy tắc OCR đã trích xuất:
+                  </div>
+                  <ul className="list-disc pl-4 space-y-1 text-slate-700">
+                    {currentSelectedTextbook.formulasOrRules.map((f, i) => (
+                      <li key={i}>{f}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div>
+                  <div className="font-bold text-slate-700 mb-1">
+                    Kiến thức trọng tâm trong bài:
+                  </div>
+                  <ul className="list-disc pl-4 space-y-1 text-slate-700">
+                    {currentSelectedTextbook.keyConcepts.map((k, i) => (
+                      <li key={i}>{k}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div>
+                  <div className="font-bold text-slate-700 mb-1">
+                    Văn bản đã quét (Text lưu trữ):
+                  </div>
+                  <pre className="p-3 rounded-lg bg-slate-900 text-slate-100 font-mono text-[11px] whitespace-pre-wrap max-h-48 overflow-y-auto">
+                    {currentSelectedTextbook.extractedText}
+                  </pre>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -890,18 +1432,34 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
       {/* TAB 3: TEXTBOOK SCANNER & JSON REPOSITORY */}
       {activeSubTab === "textbooks" && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-          {/* Upload & Scan Form */}
           <form
             onSubmit={handleScanTextbook}
             className="lg:col-span-5 rounded-xl border border-slate-200 bg-white p-6 space-y-4"
           >
             <div className="border-b border-slate-100 pb-3">
               <h2 className="text-base font-bold text-slate-900">
-                Tải Sách Giáo Khoa Lên &amp; Quét Sang Text / JSON
+                Tải Sách Giáo Khoa Lên &amp; Quét OCR Sang Text / JSON
               </h2>
               <p className="text-xs text-slate-500">
                 Hỗ trợ ảnh chụp trang sách (.jpg, .png), tài liệu PDF hoặc dán trực tiếp nội dung bài học
               </p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Model AI dùng để quét OCR &amp; bóc tách JSON:
+              </label>
+              <select
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                className="w-full px-3 py-2 text-xs font-semibold rounded-lg border border-sky-300 bg-sky-50/50 text-sky-950"
+              >
+                {AI_MODEL_OPTIONS.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
             </div>
 
             <div>
@@ -912,7 +1470,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                 type="text"
                 value={tbTitle}
                 onChange={(e) => setTbTitle(e.target.value)}
-                placeholder="VD: Toán 3 - Bài 52: Diện tích hình chữ nhật, hình vuông"
+                placeholder="VD: Tiếng Anh 3 - Unit 5: My Hobbies"
                 className="w-full px-3 py-2 text-xs rounded-lg border border-slate-200"
               />
             </div>
@@ -947,14 +1505,16 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               </div>
             </div>
 
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
+            <div className="space-y-2">
+              <label className="block text-xs font-semibold text-slate-700">
                 Tải lên ảnh trang sách / PDF / File Text:
               </label>
               <label className="flex flex-col items-center justify-center gap-1.5 p-4 rounded-xl border-2 border-dashed border-sky-200 bg-sky-50/40 hover:bg-sky-50 cursor-pointer text-xs text-sky-800">
                 <Upload className="w-5 h-5 text-sky-600" />
                 <span className="font-semibold">
-                  {tbFileName ? `Đã chọn: ${tbFileName}` : "Bấm để chọn ảnh trang SGK hoặc PDF"}
+                  {tbFileName
+                    ? `Đã nạp file: ${tbFileName} (${tbFileSizeKb} KB)`
+                    : "Bấm để chọn ảnh trang SGK (.png, .jpg) hoặc file PDF"}
                 </span>
                 <input
                   type="file"
@@ -963,6 +1523,21 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                   onChange={handleFileUpload}
                 />
               </label>
+
+              {tbFileName && fileReadProgress > 0 && (
+                <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1 text-[11px]">
+                  <div className="flex items-center justify-between font-semibold text-slate-700">
+                    <span>Tiến trình đọc file vào bộ nhớ:</span>
+                    <span className="font-mono-tabular text-emerald-700">{fileReadProgress}%</span>
+                  </div>
+                  <div className="w-full h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-emerald-600 transition-all duration-300"
+                      style={{ width: `${fileReadProgress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
             <div>
@@ -973,14 +1548,45 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                 rows={4}
                 value={tbRawText}
                 onChange={(e) => setTbRawText(e.target.value)}
-                placeholder="Dán nội dung bài học, công thức tính chu vi, diện tích, bài tập mẫu..."
+                placeholder="Dán nội dung bài học, công thức, quy tắc ngữ pháp, từ vựng..."
                 className="w-full p-3 text-xs rounded-lg border border-slate-200"
               />
             </div>
 
+            {scanningTb && (
+              <div className="p-4 rounded-xl bg-sky-50 border border-sky-200 space-y-2.5">
+                <div className="flex items-center justify-between text-xs font-bold text-sky-900">
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin text-sky-600 shrink-0" />
+                    <span>{scanStageText}</span>
+                  </span>
+                  <span className="font-mono-tabular shrink-0 ml-2">
+                    {scanProgress}% · {scanElapsedSec}s
+                  </span>
+                </div>
+                <div className="w-full h-2.5 bg-sky-100 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-sky-600 transition-all duration-500"
+                    style={{ width: `${scanProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {scanSuccessMsg && (
+              <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-900 flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>{scanSuccessMsg}</span>
+              </div>
+            )}
+
             {scanError && (
-              <div className="p-3 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-700">
-                {scanError}
+              <div className="p-3.5 rounded-xl bg-rose-50 border-2 border-rose-300 text-xs space-y-2">
+                <div className="font-bold text-rose-900 flex items-start gap-1.5">
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <span>{scanError.error}</span>
+                </div>
+                {scanError.hint && <p className="text-rose-800 pl-5">{scanError.hint}</p>}
               </div>
             )}
 
@@ -992,12 +1598,12 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               {scanningTb ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>AI đang quét OCR sang Text &amp; JSON...</span>
+                  <span>Đang quét OCR ({scanProgress}%)...</span>
                 </>
               ) : (
                 <>
                   <FileText className="w-4 h-4" />
-                  <span>Quét &amp; Lưu Vào Kho Dữ Liệu SGK</span>
+                  <span>Quét OCR ({selectedModel}) &amp; Lưu Vào Kho SGK</span>
                 </>
               )}
             </button>
@@ -1030,7 +1636,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                   </div>
                   <div className="flex items-center justify-between pt-2 border-t border-slate-100 text-[11px]">
                     <span className="text-sky-700 font-medium">
-                      {tb.formulasOrRules.length} công thức · {tb.sampleExercises.length} bài mẫu
+                      {tb.formulasOrRules.length} quy tắc · {tb.sampleExercises.length} bài mẫu
                     </span>
                     {textbooks.length > 1 && (
                       <button
@@ -1067,7 +1673,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                 <p className="text-slate-600">{selectedTbView.summary}</p>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <div className="p-3 rounded-lg bg-slate-50 border border-slate-200">
-                    <div className="font-bold text-slate-800 mb-1">Kiến thức &amp; Công thức:</div>
+                    <div className="font-bold text-slate-800 mb-1">Kiến thức &amp; Quy tắc:</div>
                     <ul className="list-disc pl-4 space-y-1 text-slate-700">
                       {selectedTbView.formulasOrRules.map((rule, i) => (
                         <li key={i}>{rule}</li>
@@ -1154,7 +1760,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                 type="text"
                 value={mTopic}
                 onChange={(e) => setMTopic(e.target.value)}
-                placeholder="VD: Tính chu vi hình chữ nhật, Nhận biết hình và đếm cạnh..."
+                placeholder="VD: Tính chu vi hình chữ nhật, Từ vựng chủ đề Động vật..."
                 className="w-full p-2 rounded-lg border border-slate-200"
               />
             </div>
@@ -1171,7 +1777,6 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               />
             </div>
 
-            {/* Geometry Configuration */}
             <div className="p-3.5 rounded-xl bg-sky-50/60 border border-sky-200 space-y-3">
               <label className="flex items-center gap-2 font-bold text-sky-900 cursor-pointer">
                 <input
@@ -1273,7 +1878,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               </div>
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">
-                  Câu đọc phát âm Tiếng Anh (nếu có):
+                  Câu đọc phát âm Tiếng Anh (sẽ ẩn chữ khi bé làm bài):
                 </label>
                 <input
                   type="text"
@@ -1337,13 +1942,20 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
         </div>
       )}
 
-      {/* TAB 5: APPROVED QUESTION BANK */}
+      {/* TAB 5: APPROVED UNCOMPLETED QUESTION BANK */}
       {activeSubTab === "approved_bank" && (
         <div className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="rounded-xl border border-slate-200 bg-white p-4 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-bold text-slate-900">
+                Ngân Hàng Đề Đã Duyệt Chờ {activeChildName} Làm ({uncompletedApprovedQuestions.length} câu)
+              </h2>
+              <p className="text-xs text-slate-500">
+                Những câu này hiện đang sẵn sàng cho bé làm. Khi bé làm xong câu nào, câu đó sẽ tự động trừ khỏi đây và chuyển sang mục "Bé Đã Làm Xong".
+              </p>
+            </div>
             <div className="flex items-center gap-2">
               <Filter className="w-4 h-4 text-slate-500" />
-              <span className="text-xs font-semibold text-slate-700">Lọc theo môn:</span>
               {(["all", "math", "vietnamese", "english", "science"] as const).map((sub) => (
                 <button
                   key={sub}
@@ -1352,7 +1964,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                   className={`px-3 py-1.5 rounded-lg text-xs font-medium ${
                     bankSubjectFilter === sub
                       ? "bg-slate-900 text-white"
-                      : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200"
                   }`}
                 >
                   {sub === "all" ? "Tất cả môn" : SUBJECT_META[sub].shortLabel}
@@ -1362,7 +1974,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {approvedQuestions
+            {uncompletedApprovedQuestions
               .filter((q) => bankSubjectFilter === "all" || q.subject === bankSubjectFilter)
               .map((q) => (
                 <div
@@ -1396,6 +2008,68 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                 </div>
               ))}
           </div>
+        </div>
+      )}
+
+      {/* TAB 6: COMPLETED QUESTIONS ARCHIVE */}
+      {activeSubTab === "completed_bank" && (
+        <div className="space-y-4">
+          <div className="rounded-xl border border-slate-200 bg-white p-5 flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h2 className="text-base font-bold text-slate-900">
+                Mục Câu Hỏi {activeChildName} Đã Làm Xong ({completedApprovedQuestions.length} câu)
+              </h2>
+              <p className="text-xs text-slate-500">
+                Các câu hỏi này đã bị trừ khỏi Ngân hàng đề chờ làm để bé không thể làm đi làm lại lấy thưởng YouTube. Nếu muốn cho bé làm lại, bạn có thể bấm Khôi phục.
+              </p>
+            </div>
+
+            {completedApprovedQuestions.length > 0 && (
+              <button
+                type="button"
+                onClick={onRestoreAllCompletedQuestions}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold whitespace-nowrap shrink-0"
+              >
+                <RotateCcw className="w-4 h-4" />
+                <span>Khôi phục tất cả ({completedApprovedQuestions.length} câu) về Ngân hàng Chờ làm</span>
+              </button>
+            )}
+          </div>
+
+          {completedApprovedQuestions.length === 0 ? (
+            <div className="rounded-xl border border-slate-200 bg-white p-10 text-center text-xs text-slate-500">
+              Hiện chưa có câu hỏi nào trong mục Đã làm xong của {activeChildName}. Khi bé hoàn thành bài tập ở Góc Học Tập, các câu đã làm sẽ chuyển về đây.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {completedApprovedQuestions.map((q) => (
+                <div
+                  key={q.id}
+                  className="rounded-xl border border-slate-200 bg-white p-5 flex flex-col justify-between gap-3"
+                >
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between text-xs text-slate-500">
+                      <span>
+                        {SUBJECT_META[q.subject].shortLabel} · {q.topic}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onRestoreCompletedQuestion(q.id)}
+                        className="inline-flex items-center gap-1 text-sky-700 font-semibold hover:underline"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>Chuyển lại vào Ngân hàng Chờ làm</span>
+                      </button>
+                    </div>
+                    <p className="text-sm font-bold text-slate-900">{q.questionText}</p>
+                    <div className="text-xs text-emerald-700 font-semibold">
+                      Đáp án: {q.correctAnswer}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>

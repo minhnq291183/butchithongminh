@@ -1,51 +1,77 @@
-import React, { useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { BUILTIN_DICTIONARY } from "../data/seedData";
 import { DictionaryEntry } from "../types";
 import { BookOpen, Loader2, Search, Sparkles } from "lucide-react";
 
 interface DictionaryToolProps {
   grade: number;
+  externalWord?: string | null;
+  onExternalWordHandled?: () => void;
   suggestedWords?: string[];
 }
 
 export const DictionaryTool: React.FC<DictionaryToolProps> = ({
   grade,
-  suggestedWords = ["chu vi", "diện tích", "tứ giác", "ngũ giác", "lục giác", "quang hợp", "chăm chỉ", "trong trẻo"],
+  externalWord,
+  onExternalWordHandled,
+  suggestedWords = [
+    "chu vi",
+    "diện tích",
+    "tứ giác",
+    "ngũ giác",
+    "lục giác",
+    "quang hợp",
+    "chăm chỉ",
+    "trong trẻo",
+  ],
 }) => {
   const [query, setQuery] = useState<string>("");
   const [entry, setEntry] = useState<DictionaryEntry | null>(BUILTIN_DICTIONARY["chu vi"]);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleLookup = async (wordToSearch: string) => {
-    const clean = wordToSearch.trim().toLowerCase();
-    if (!clean) return;
-    setQuery(wordToSearch);
-    setError(null);
+  const handleLookup = useCallback(
+    async (wordToSearch: string) => {
+      const clean = wordToSearch.trim().toLowerCase();
+      if (!clean) return;
+      setQuery(wordToSearch.trim());
+      setError(null);
 
-    if (BUILTIN_DICTIONARY[clean]) {
-      setEntry(BUILTIN_DICTIONARY[clean]);
-      return;
-    }
-
-    setLoading(true);
-    try {
-      const res = await fetch("/api/ai/dictionary", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ word: wordToSearch.trim(), grade }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Không tìm thấy từ này.");
+      if (BUILTIN_DICTIONARY[clean]) {
+        setEntry(BUILTIN_DICTIONARY[clean]);
+        return;
       }
-      setEntry(data);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Lỗi tra cứu từ điển.");
-    } finally {
-      setLoading(false);
+
+      setLoading(true);
+      try {
+        const res = await fetch("/api/ai/dictionary", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ word: wordToSearch.trim(), grade }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "Không tìm thấy từ này.");
+        }
+        setEntry(data);
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : "Lỗi tra cứu từ điển.");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [grade]
+  );
+
+  // Automatically look up word when highlighted from question text
+  useEffect(() => {
+    if (externalWord && externalWord.trim()) {
+      handleLookup(externalWord.trim());
+      if (onExternalWordHandled) {
+        onExternalWordHandled();
+      }
     }
-  };
+  }, [externalWord, handleLookup, onExternalWordHandled]);
 
   return (
     <div className="flex flex-col h-full space-y-3">
@@ -62,7 +88,7 @@ export const DictionaryTool: React.FC<DictionaryToolProps> = ({
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Nhập từ khó con chưa hiểu (VD: chu vi, lục giác, quang hợp)..."
+            placeholder="Nhập hoặc bôi đen từ khó trong đề để tra..."
             className="w-full pl-9 pr-3 py-2 text-sm rounded-lg border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-sky-500"
           />
         </div>
@@ -93,7 +119,7 @@ export const DictionaryTool: React.FC<DictionaryToolProps> = ({
       {loading && (
         <div className="flex items-center justify-center gap-2 py-10 text-sm text-sky-700">
           <Loader2 className="w-5 h-5 animate-spin" />
-          <span>Cô giáo AI đang giải nghĩa từ dễ hiểu cho con...</span>
+          <span>Cô giáo AI đang giải nghĩa từ “{query}” dễ hiểu cho con...</span>
         </div>
       )}
 

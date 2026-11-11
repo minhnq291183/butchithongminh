@@ -24,7 +24,7 @@ import { StudentWorkspace } from "./components/StudentWorkspace";
 import { DashboardAnalytics } from "./components/DashboardAnalytics";
 import { YouTubeRewardPlayer } from "./components/YouTubeRewardPlayer";
 import { TeacherPortal } from "./components/TeacherPortal";
-import { Lock, Plus, Settings, Star, Tv, UserCheck, X } from "lucide-react";
+import { Lock, Plus, RotateCcw, Trash2, UserCheck, X } from "lucide-react";
 
 type MainNavTab = "student" | "dashboard" | "rewards" | "teacher";
 
@@ -256,9 +256,25 @@ export default function App() {
   const handleCompleteSession = (
     session: StudySessionRecord,
     newMistakes: MistakeRecord[],
-    resolvedQuestionIds: string[]
+    resolvedQuestionIds: string[],
+    completedQuestionIds: string[]
   ) => {
     setSessions((prev) => [session, ...prev]);
+
+    // Subtract completed questions from the child's active question bank so they cannot repeat them to farm rewards
+    if (completedQuestionIds.length > 0) {
+      setQuestions((prev) =>
+        prev.map((q) => {
+          if (!completedQuestionIds.includes(q.id)) return q;
+          const existingList = q.completedByChildIds || [];
+          if (existingList.includes(activeProfile.id)) return q;
+          return {
+            ...q,
+            completedByChildIds: [...existingList, activeProfile.id],
+          };
+        })
+      );
+    }
 
     // Update profile YouTube minutes, stars & study streak
     setProfiles((prev) =>
@@ -285,6 +301,32 @@ export default function App() {
       );
       return [...newMistakes, ...updated];
     });
+  };
+
+  const handleRestoreCompletedQuestion = (questionId: string) => {
+    setQuestions((prev) =>
+      prev.map((q) =>
+        q.id === questionId
+          ? {
+              ...q,
+              completedByChildIds: (q.completedByChildIds || []).filter(
+                (id) => id !== activeProfile.id
+              ),
+            }
+          : q
+      )
+    );
+  };
+
+  const handleRestoreAllCompletedQuestions = () => {
+    setQuestions((prev) =>
+      prev.map((q) => ({
+        ...q,
+        completedByChildIds: (q.completedByChildIds || []).filter(
+          (id) => id !== activeProfile.id
+        ),
+      }))
+    );
   };
 
   const handleDeductYoutubeMinutes = (mins: number) => {
@@ -341,6 +383,72 @@ export default function App() {
     }
   };
 
+  const handleDeleteProfile = (profileIdToDelete: string) => {
+    const remaining = profiles.filter((p) => p.id !== profileIdToDelete);
+
+    // Clean up associated history for the deleted profile
+    setSessions((prev) => prev.filter((s) => s.childId !== profileIdToDelete));
+    setMistakes((prev) => prev.filter((m) => m.childId !== profileIdToDelete));
+    setRedeemLogs((prev) => prev.filter((r) => r.childId !== profileIdToDelete));
+    setQuestions((prev) =>
+      prev.map((q) => ({
+        ...q,
+        completedByChildIds: (q.completedByChildIds || []).filter(
+          (id) => id !== profileIdToDelete
+        ),
+      }))
+    );
+
+    if (remaining.length > 0) {
+      setProfiles(remaining);
+      if (activeProfileId === profileIdToDelete) {
+        setActiveProfileId(remaining[0].id);
+      }
+      if (editingProfile?.id === profileIdToDelete) {
+        handleOpenEditProfile(remaining[0]);
+      }
+    } else {
+      // If the user deleted the very last profile, create a fresh blank profile ready for their child's name
+      const freshProfile: ChildProfile = {
+        id: `child-${Date.now()}`,
+        name: "Bé Yêu",
+        nickname: "Bé",
+        grade: 3,
+        avatarColor: "#0284C7",
+        avatarIcon: "star",
+        youtubeMinutes: 0,
+        stars: 0,
+        streakDays: 0,
+        lastStudyDate: "",
+        dailyGoalMinutes: 25,
+      };
+      setProfiles([freshProfile]);
+      setActiveProfileId(freshProfile.id);
+      handleOpenEditProfile(freshProfile);
+    }
+  };
+
+  const handleResetProfileStats = (profileIdToReset: string) => {
+    setProfiles((prev) =>
+      prev.map((p) =>
+        p.id === profileIdToReset
+          ? { ...p, youtubeMinutes: 0, stars: 0, streakDays: 0, lastStudyDate: "" }
+          : p
+      )
+    );
+    setSessions((prev) => prev.filter((s) => s.childId !== profileIdToReset));
+    setMistakes((prev) => prev.filter((m) => m.childId !== profileIdToReset));
+    setRedeemLogs((prev) => prev.filter((r) => r.childId !== profileIdToReset));
+    setQuestions((prev) =>
+      prev.map((q) => ({
+        ...q,
+        completedByChildIds: (q.completedByChildIds || []).filter(
+          (id) => id !== profileIdToReset
+        ),
+      }))
+    );
+  };
+
   const handleSaveProfile = (e: React.FormEvent) => {
     e.preventDefault();
     if (!pName.trim()) return;
@@ -367,10 +475,10 @@ export default function App() {
         grade: pGrade,
         avatarColor: "#0284C7",
         avatarIcon: "star",
-        youtubeMinutes: 5.0,
-        stars: 10,
-        streakDays: 1,
-        lastStudyDate: new Date().toISOString().slice(0, 10),
+        youtubeMinutes: 0,
+        stars: 0,
+        streakDays: 0,
+        lastStudyDate: "",
         dailyGoalMinutes: pGoal,
       };
       setProfiles((prev) => [...prev, newProf]);
@@ -426,7 +534,7 @@ export default function App() {
       {/* Strict 3-Zone Top Navigation Bar */}
       <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-xs border-b border-slate-200 px-6 py-3.5">
         <div className="max-w-[1360px] mx-auto flex items-center justify-between gap-8">
-          {/* Zone 1: Brand Title (single text element) */}
+          {/* Zone 1: Brand Title */}
           <a
             href="#top"
             onClick={(e) => {
@@ -494,7 +602,7 @@ export default function App() {
                 handleOpenEditProfile(activeProfile);
                 setShowProfileModal(true);
               }}
-              className="px-4 py-2 text-xs font-bold text-white bg-sky-600 hover:bg-sky-700 rounded-lg transition-colors whitespace-nowrap shrink-0"
+              className="px-4 py-2 text-xs font-extrabold text-white bg-sky-600 hover:bg-sky-700 border-b-4 border-sky-800 rounded-xl shadow-xs transition-all active:translate-y-0.5 whitespace-nowrap shrink-0"
             >
               Hồ sơ: {activeProfile.name} (Lớp {activeProfile.grade})
             </button>
@@ -511,6 +619,7 @@ export default function App() {
             mistakes={mistakes}
             initialReviewConfig={reviewTrigger}
             onClearInitialReview={() => setReviewTrigger(null)}
+            onGoToRewards={() => setActiveTab("rewards")}
             onCompleteSession={handleCompleteSession}
           />
         )}
@@ -599,6 +708,8 @@ export default function App() {
               </div>
             ) : (
               <TeacherPortal
+                activeChildId={activeProfile.id}
+                activeChildName={activeProfile.name}
                 grade={activeProfile.grade}
                 textbooks={textbooks}
                 questions={questions}
@@ -629,6 +740,8 @@ export default function App() {
                 onDeleteQuestion={(id) =>
                   setQuestions((prev) => prev.filter((q) => q.id !== id))
                 }
+                onRestoreCompletedQuestion={handleRestoreCompletedQuestion}
+                onRestoreAllCompletedQuestions={handleRestoreAllCompletedQuestions}
                 onExportBackup={handleExportBackup}
                 onImportBackup={handleImportBackup}
               />
@@ -647,7 +760,7 @@ export default function App() {
                   Quản Lý Hồ Sơ Các Bé Trong Gia Đình
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Chọn hồ sơ của bé để lưu riêng điểm số, phút YouTube, số sao và các câu làm sai
+                  Chọn hồ sơ của bé để lưu riêng điểm số, phút YouTube, số sao và các câu đã làm
                 </p>
               </div>
               <button
@@ -659,7 +772,6 @@ export default function App() {
               </button>
             </div>
 
-            {/* List of Existing Child Profiles */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {profiles.map((prof) => {
                 const isCurrent = prof.id === activeProfile.id;
@@ -670,47 +782,80 @@ export default function App() {
                       setActiveProfileId(prof.id);
                       handleOpenEditProfile(prof);
                     }}
-                    className={`p-3.5 rounded-xl border cursor-pointer transition-all flex items-center justify-between ${
+                    className={`p-3.5 rounded-xl border cursor-pointer transition-all flex items-center justify-between gap-2 ${
                       isCurrent
                         ? "border-2 border-sky-600 bg-sky-50/60"
                         : "border-slate-200 hover:bg-slate-50"
                     }`}
                   >
-                    <div className="space-y-0.5">
-                      <div className="text-sm font-bold text-slate-900">
-                        {prof.name} ({prof.nickname})
+                    <div className="space-y-0.5 min-w-0">
+                      <div className="text-sm font-bold text-slate-900 truncate flex items-center gap-1.5">
+                        <span>
+                          {prof.name} ({prof.nickname})
+                        </span>
+                        {isCurrent && <UserCheck className="w-4 h-4 text-sky-600 shrink-0" />}
                       </div>
                       <div className="text-xs text-slate-600">
                         Lớp {prof.grade} · {prof.youtubeMinutes.toFixed(1)}p YT · {prof.stars} Sao
                       </div>
                     </div>
-                    {isCurrent && <UserCheck className="w-5 h-5 text-sky-600 shrink-0" />}
+
+                    <button
+                      type="button"
+                      title={`Xóa hồ sơ ${prof.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteProfile(prof.id);
+                      }}
+                      className="p-2 rounded-lg text-rose-500 hover:text-rose-700 hover:bg-rose-50 border border-transparent hover:border-rose-200 transition-colors shrink-0"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                   </div>
                 );
               })}
             </div>
 
-            {/* Add or Edit Form */}
             <form
               onSubmit={handleSaveProfile}
               className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3 text-xs"
             >
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="font-bold text-slate-800">
                   {editingProfile
                     ? `Chỉnh sửa hồ sơ: ${editingProfile.name}`
                     : "Tạo hồ sơ bé mới"}
                 </span>
-                {editingProfile && (
-                  <button
-                    type="button"
-                    onClick={() => handleOpenEditProfile(undefined)}
-                    className="inline-flex items-center gap-1 text-sky-700 font-semibold hover:underline"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>Thêm bé khác</span>
-                  </button>
-                )}
+                <div className="flex items-center gap-3">
+                  {editingProfile && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleResetProfileStats(editingProfile.id)}
+                        className="inline-flex items-center gap-1 text-amber-700 font-semibold hover:underline"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>Đặt lại Sao &amp; Phút về 0</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteProfile(editingProfile.id)}
+                        className="inline-flex items-center gap-1 text-rose-600 font-semibold hover:underline"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Xóa hồ sơ này</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleOpenEditProfile(undefined)}
+                        className="inline-flex items-center gap-1 text-sky-700 font-semibold hover:underline"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>Thêm bé mới</span>
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">

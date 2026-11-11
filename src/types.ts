@@ -53,6 +53,7 @@ export interface QuestionItem {
   explanation: string;
   geometrySpec?: GeometrySpec;
   sourceTextbookId?: string;
+  completedByChildIds?: string[]; // Tracks which children have already completed this question so they cannot farm rewards
   createdAt: string;
 }
 
