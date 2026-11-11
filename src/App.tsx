@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ChildProfile,
   CustomRewardItem,
@@ -33,7 +33,7 @@ const STORAGE_KEY = "but_chi_thong_minh_state_v1";
 export default function App() {
   const [activeTab, setActiveTab] = useState<MainNavTab>("student");
 
-  // Persistent State
+  // Persistent State (Initializes from local cache first, then hydrates from Ubuntu server /api/state)
   const [profiles, setProfiles] = useState<ChildProfile[]>(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) {
@@ -200,22 +200,156 @@ export default function App() {
     return "1234";
   });
 
-  // Save state to localStorage on change
+  // Guards to ensure a new browser/device loads from the Ubuntu server first before saving back
+  const serverHydratedRef = useRef<boolean>(false);
+  const skipNextServerPushRef = useRef<boolean>(false);
+  const lastServerUpdatedAtRef = useRef<string>("");
+
+  const applyRemoteState = useCallback((remote: Record<string, unknown>) => {
+    skipNextServerPushRef.current = true;
+    if (Array.isArray(remote.profiles) && remote.profiles.length > 0) {
+      setProfiles(remote.profiles as ChildProfile[]);
+    }
+    if (typeof remote.activeProfileId === "string" && remote.activeProfileId) {
+      setActiveProfileId(remote.activeProfileId);
+    }
+    if (Array.isArray(remote.textbooks)) {
+      setTextbooks(remote.textbooks as TextbookMaterial[]);
+    }
+    if (Array.isArray(remote.questions)) {
+      setQuestions(remote.questions as QuestionItem[]);
+    }
+    if (Array.isArray(remote.sessions)) {
+      setSessions(remote.sessions as StudySessionRecord[]);
+    }
+    if (Array.isArray(remote.mistakes)) {
+      setMistakes(remote.mistakes as MistakeRecord[]);
+    }
+    if (Array.isArray(remote.customRewards)) {
+      setCustomRewards(remote.customRewards as CustomRewardItem[]);
+    }
+    if (Array.isArray(remote.redeemLogs)) {
+      setRedeemLogs(remote.redeemLogs as RedeemedRewardLog[]);
+    }
+    if (typeof remote.parentPin === "string" && remote.parentPin) {
+      setParentPin(remote.parentPin);
+    }
+    if (typeof remote.updatedAt === "string") {
+      lastServerUpdatedAtRef.current = remote.updatedAt;
+    }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(remote));
+  }, []);
+
+  // 1. On initial mount (and when switching tabs/devices), fetch shared state from the Ubuntu server (/api/state)
   useEffect(() => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        profiles,
-        activeProfileId,
-        textbooks,
-        questions,
-        sessions,
-        mistakes,
-        customRewards,
-        redeemLogs,
-        parentPin,
-      })
-    );
+    let isMounted = true;
+
+    const syncFromServer = async (isInitialLoad: boolean) => {
+      try {
+        const res = await fetch("/api/state");
+        if (!res.ok) {
+          serverHydratedRef.current = true;
+          return;
+        }
+        const data = await res.json();
+        if (!isMounted) return;
+
+        if (data.exists && data.state) {
+          // Only re-apply on focus if server has newer data
+          if (
+            isInitialLoad ||
+            (data.state.updatedAt && data.state.updatedAt !== lastServerUpdatedAtRef.current)
+          ) {
+            applyRemoteState(data.state);
+          }
+          serverHydratedRef.current = true;
+        } else if (isInitialLoad) {
+          // Server has no database.json yet -> seed server with this browser's current state!
+          serverHydratedRef.current = true;
+          const initialPayload = {
+            profiles,
+            activeProfileId,
+            textbooks,
+            questions,
+            sessions,
+            mistakes,
+            customRewards,
+            redeemLogs,
+            parentPin,
+          };
+          const saveRes = await fetch("/api/state", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(initialPayload),
+          });
+          if (saveRes.ok) {
+            const savedMeta = await saveRes.json();
+            if (savedMeta.updatedAt) {
+              lastServerUpdatedAtRef.current = savedMeta.updatedAt;
+            }
+          }
+        }
+      } catch {
+        serverHydratedRef.current = true;
+      }
+    };
+
+    syncFromServer(true);
+
+    const handleWindowFocus = () => {
+      if (serverHydratedRef.current) {
+        syncFromServer(false);
+      }
+    };
+    window.addEventListener("focus", handleWindowFocus);
+    return () => {
+      isMounted = false;
+      window.removeEventListener("focus", handleWindowFocus);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyRemoteState]);
+
+  // 2. Whenever state changes after hydration, persist to both localStorage AND Ubuntu server (/api/state)
+  useEffect(() => {
+    const payload = {
+      profiles,
+      activeProfileId,
+      textbooks,
+      questions,
+      sessions,
+      mistakes,
+      customRewards,
+      redeemLogs,
+      parentPin,
+    };
+
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+
+    if (!serverHydratedRef.current) return;
+    if (skipNextServerPushRef.current) {
+      skipNextServerPushRef.current = false;
+      return;
+    }
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const res = await fetch("/api/state", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.updatedAt) {
+            lastServerUpdatedAtRef.current = data.updatedAt;
+          }
+        }
+      } catch {
+        // Offline fallback remains in localStorage
+      }
+    }, 200);
+
+    return () => window.clearTimeout(timer);
   }, [
     profiles,
     activeProfileId,

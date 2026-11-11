@@ -1,4 +1,5 @@
 import express from "express";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
@@ -9,10 +10,19 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const DATA_DIR = path.join(__dirname, "data");
+const DB_FILE_PATH = path.join(DATA_DIR, "database.json");
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: "35mb" }));
+app.use(express.json({ limit: "50mb" }));
 
 const ALLOWED_MODELS = [
   "gemini-3.8-flash",
@@ -221,6 +231,45 @@ function repairAndParseJson<T>(rawText: string, fallbackType: "object" | "array"
     throw new Error("Không thể phân tích cú pháp JSON từ phản hồi của AI.");
   }
 }
+
+// 0A. Server-side Shared Database Endpoints (Persists across all devices on LAN / Ubuntu Server)
+app.get("/api/state", (_req, res) => {
+  try {
+    ensureDataDir();
+    if (!fs.existsSync(DB_FILE_PATH)) {
+      res.json({ exists: false, state: null });
+      return;
+    }
+    const raw = fs.readFileSync(DB_FILE_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    res.json({ exists: true, state: parsed });
+  } catch (error) {
+    console.error("Error reading server state:", error);
+    res.status(500).json({ exists: false, error: "Không thể đọc dữ liệu từ máy chủ." });
+  }
+});
+
+app.post("/api/state", (req, res) => {
+  try {
+    ensureDataDir();
+    const statePayload = req.body;
+    if (!statePayload || typeof statePayload !== "object") {
+      res.status(400).json({ ok: false, error: "Dữ liệu không hợp lệ." });
+      return;
+    }
+    const payloadWithMeta = {
+      ...statePayload,
+      updatedAt: new Date().toISOString(),
+    };
+    const tempFilePath = `${DB_FILE_PATH}.tmp`;
+    fs.writeFileSync(tempFilePath, JSON.stringify(payloadWithMeta, null, 2), "utf-8");
+    fs.renameSync(tempFilePath, DB_FILE_PATH);
+    res.json({ ok: true, updatedAt: payloadWithMeta.updatedAt });
+  } catch (error) {
+    console.error("Error writing server state:", error);
+    res.status(500).json({ ok: false, error: "Không thể lưu dữ liệu xuống máy chủ." });
+  }
+});
 
 // 0. Health / Diagnostic Endpoint to verify API Key & Selected Model
 app.post("/api/ai/check-status", async (req, res) => {
