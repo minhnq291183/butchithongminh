@@ -52,28 +52,33 @@ interface TeacherPortalProps {
 export const AI_MODEL_OPTIONS = [
   {
     id: "gemini-3.8-flash",
-    label: "Gemini 3.8 Flash (Khuyên dùng — Chuẩn xác & Nhanh)",
-    badge: "Mặc định",
-  },
-  {
-    id: "gemini-3.1-flash-lite",
-    label: "Gemini 3.1 Flash Lite (Siêu nhanh — Tiết kiệm hạn mức Key nhất)",
-    badge: "Nhẹ & Nhanh",
-  },
-  {
-    id: "gemini-flash-latest",
-    label: "Gemini Flash Latest (Ổn định — Tương thích rộng mọi API Key)",
-    badge: "Ổn định",
+    label: "Gemini 3.8 Flash (Mặc định — Khuyên dùng: Chuẩn tiếng Việt & Nhanh)",
+    badge: "Mặc định khuyên dùng",
+    desc: "Mô hình chính thức khuyên dùng cho Tiếng Việt, câu từ tự nhiên, chuẩn mực sư phạm và tốc độ rất nhanh.",
   },
   {
     id: "gemini-4-argon",
-    label: "Gemini 4 Argon / Pro (Chuyên sâu Toán nâng cao — Cần Key trả phí)",
-    badge: "Pro",
+    label: "Gemini 4 Argon / Pro (Mô hình Cao Cấp — Chuyên sâu tư duy & Toán lời văn phức tạp)",
+    badge: "Mạnh nhất (Pro)",
+    desc: "Lý tưởng cho đề thi nâng cao, phân tích ngữ nghĩa tiếng Việt sâu sắc và toán tư duy 2 bước.",
   },
   {
     id: "gemini-4-carbon",
-    label: "Gemini 4 Carbon (Tư duy logic sâu nhất — Cần Key trả phí)",
-    badge: "Deep",
+    label: "Gemini 4 Carbon (Siêu Tư Duy — Thẩm định logic bài toán khắt khe nhất)",
+    badge: "Deep Reasoning",
+    desc: "Mô hình tư duy sâu với khả năng suy luận logic và kiểm tra dữ kiện chặt chẽ nhất.",
+  },
+  {
+    id: "gemini-flash-latest",
+    label: "Gemini Flash Latest (Bản Flash mới nhất — Ổn định cao)",
+    badge: "Ổn định",
+    desc: "Bản Flash ổn định, tương thích rộng rãi.",
+  },
+  {
+    id: "gemini-3.1-flash-lite",
+    label: "Gemini 3.1 Flash Lite (Bản Nhẹ — Tiết kiệm hạn mức Key nhất)",
+    badge: "Tiết kiệm",
+    desc: "Phù hợp khi cần quét nhanh hoặc tài khoản API Key có hạn mức thấp.",
   },
 ];
 
@@ -478,6 +483,11 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               : {},
             preferredCategories: genCategories,
             weakTopics: useWeakTopics ? weakTopicSummary : [],
+            existingQuestions: questions.map((q) => ({
+              questionText: q.questionText,
+              correctAnswer: q.correctAnswer,
+            })),
+            rotationIndex: batchIndex,
           }),
         });
 
@@ -501,7 +511,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
         const rawList = Array.isArray(data.questions) ? data.questions : [];
         if (rawList.length > 0) {
           const createdItems: QuestionItem[] = rawList.map(
-            (item: Partial<QuestionItem> & { geometrySpec?: GeometrySpec }, idx: number) => ({
+            (item: Partial<QuestionItem> & { geometrySpec?: GeometrySpec; warning?: string; acceptedAnswers?: string[] }, idx: number) => ({
               id: `q-ai-${Date.now()}-${batchIndex}-${idx}`,
               subject: targetTb?.subject || "math",
               grade: targetTb?.grade || grade,
@@ -513,7 +523,9 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               audioText: item.audioText || undefined,
               options: Array.isArray(item.options) ? item.options : [],
               correctAnswer: String(item.correctAnswer || ""),
+              acceptedAnswers: Array.isArray(item.acceptedAnswers) ? item.acceptedAnswers : undefined,
               explanation: item.explanation || "",
+              warning: item.warning || undefined,
               geometrySpec:
                 item.geometrySpec &&
                 (item.geometrySpec.hasGeometry || item.type === "geometry_visual")
@@ -677,47 +689,58 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
         </div>
 
         {/* Global AI Model Selector & API Key Health Checker */}
-        <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 flex flex-wrap items-center justify-between gap-4">
-          <div className="flex flex-wrap items-center gap-3 flex-1 min-w-[280px]">
-            <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800 whitespace-nowrap">
-              <Cpu className="w-4 h-4 text-sky-600" />
-              <span>Chọn Model AI (Quét SGK &amp; Ra đề):</span>
+        <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="flex flex-wrap items-center gap-3 flex-1 min-w-[280px]">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800 whitespace-nowrap">
+                <Cpu className="w-4 h-4 text-sky-600" />
+                <span>Chọn Model AI (Quét SGK &amp; Ra đề):</span>
+              </div>
+              <select
+                value={selectedModel}
+                onChange={(e) => {
+                  setSelectedModel(e.target.value);
+                  setKeyStatusResult(null);
+                }}
+                className="flex-1 min-w-[240px] max-w-md px-3 py-2 text-xs font-semibold rounded-lg border border-slate-300 bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500"
+              >
+                {AI_MODEL_OPTIONS.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
             </div>
-            <select
-              value={selectedModel}
-              onChange={(e) => {
-                setSelectedModel(e.target.value);
-                setKeyStatusResult(null);
-              }}
-              className="flex-1 min-w-[240px] max-w-md px-3 py-2 text-xs font-semibold rounded-lg border border-slate-300 bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500"
-            >
-              {AI_MODEL_OPTIONS.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={checkingKey}
+                onClick={() => handleCheckModelStatus(selectedModel)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
+              >
+                {checkingKey ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Đang kiểm tra Key &amp; Model...</span>
+                  </>
+                ) : (
+                  <>
+                    <Activity className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Kiểm tra Model &amp; API Key</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              disabled={checkingKey}
-              onClick={() => handleCheckModelStatus(selectedModel)}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
-            >
-              {checkingKey ? (
-                <>
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  <span>Đang kiểm tra Key &amp; Model...</span>
-                </>
-              ) : (
-                <>
-                  <Activity className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Kiểm tra Model &amp; API Key</span>
-                </>
-              )}
-            </button>
+          <div className="text-[11px] text-slate-600 bg-white p-2.5 rounded-lg border border-slate-200 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <strong className="text-slate-800">Gợi ý chọn Model: </strong>
+              <span>
+                Mặc định sử dụng <strong>gemini-3.8-flash</strong> (chuẩn tiếng Việt, ngữ pháp tự nhiên, ra đề rất nhanh). Để ra đề Tiếng Việt và Toán nâng cao có lập luận sâu nhất, hãy chọn <strong>gemini-4-argon</strong> hoặc <strong>gemini-4-carbon</strong>.
+              </span>
+            </div>
           </div>
 
           {keyStatusResult && (
@@ -842,7 +865,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                 Kiểm tra kỹ đề bài, hình vẽ minh họa, đáp án và lời giải. Chỉ những câu đã bấm Duyệt mới xuất hiện trong phần làm bài của con.
               </p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={() => setActiveSubTab("ai_generator")}
@@ -851,16 +874,33 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                 <Sparkles className="w-4 h-4" />
                 <span>Tạo thêm câu hỏi bằng AI</span>
               </button>
-              {pendingQuestions.length > 0 && (
-                <button
-                  type="button"
-                  onClick={onApproveAllPending}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 whitespace-nowrap shrink-0"
-                >
-                  <CheckCircle2 className="w-4 h-4" />
-                  <span>Duyệt tất cả ({pendingQuestions.length} câu)</span>
-                </button>
-              )}
+
+              {(() => {
+                const validPending = pendingQuestions.filter((q) => !q.warning);
+                const warnedPending = pendingQuestions.filter((q) => Boolean(q.warning));
+
+                return (
+                  <div className="flex flex-wrap items-center gap-2">
+                    {warnedPending.length > 0 && (
+                      <span className="px-2.5 py-1.5 rounded-lg bg-amber-50 border border-amber-300 text-amber-900 text-xs font-semibold">
+                        ⚠️ {warnedPending.length} câu có cảnh báo (phải duyệt riêng)
+                      </span>
+                    )}
+
+                    <button
+                      type="button"
+                      disabled={validPending.length === 0}
+                      onClick={onApproveAllPending}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap shrink-0"
+                    >
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>
+                        Duyệt các câu đạt chuẩn ({validPending.length}/{pendingQuestions.length} câu)
+                      </span>
+                    </button>
+                  </div>
+                );
+              })()}
             </div>
           </div>
 
@@ -1018,11 +1058,36 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                               : "lg:col-span-12 space-y-3"
                           }
                         >
+                          {item.warning && (
+                            <div className="p-3 rounded-xl bg-amber-50 border-2 border-amber-300 text-amber-950 text-xs font-bold flex items-start gap-2.5">
+                              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                              <div className="space-y-0.5">
+                                <span className="font-extrabold uppercase text-[10px] text-amber-800 tracking-wide block">
+                                  ⚠️ Cảnh báo chất lượng từ hệ thống kiểm tra &amp; AI:
+                                </span>
+                                <span className="font-semibold text-amber-900 leading-relaxed">
+                                  {item.warning}
+                                </span>
+                                <p className="text-[11px] text-amber-700 font-normal">
+                                  (Câu này bị loại khỏi "Duyệt tất cả". Bố mẹ hãy bấm "Chỉnh sửa câu" hoặc kiểm tra kỹ trước khi bấm "Duyệt câu này")
+                                </p>
+                              </div>
+                            </div>
+                          )}
+
                           <p className="text-base font-bold text-slate-900">{item.questionText}</p>
+
                           {item.audioText && (
                             <div className="text-xs text-amber-800 bg-amber-50 px-3 py-1.5 rounded-lg border border-amber-200">
                               🔊 Nội dung phát âm (sẽ ẩn chữ khi bé làm bài):{" "}
                               <strong>“{item.audioText}”</strong>
+                            </div>
+                          )}
+
+                          {Array.isArray(item.acceptedAnswers) && item.acceptedAnswers.length > 0 && (
+                            <div className="text-xs text-sky-800 bg-sky-50 px-3 py-1.5 rounded-lg border border-sky-200">
+                              ✓ Các đáp án đồng nghĩa được chấp nhận:{" "}
+                              <strong>{item.acceptedAnswers.join(", ")}</strong>
                             </div>
                           )}
                           {item.options.length > 0 && (

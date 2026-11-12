@@ -219,8 +219,14 @@ export const StudentWorkspace: React.FC<StudentWorkspaceProps> = ({
   const normalizeAnswer = (val: string) =>
     val.trim().toLowerCase().replace(/\s+/g, " ");
 
-  const isAnswerMatch = (ans: string, correct: string) =>
-    normalizeAnswer(ans) === normalizeAnswer(correct);
+  const isAnswerMatch = (ans: string, correct: string, accepted?: string[]) => {
+    const user = normalizeAnswer(ans);
+    if (user === normalizeAnswer(correct)) return true;
+    if (Array.isArray(accepted) && accepted.length > 0) {
+      return accepted.some((alt) => normalizeAnswer(alt) === user);
+    }
+    return false;
+  };
 
   const finalizeQuizSubmission = (
     finalAnswers: Record<string, string>,
@@ -242,7 +248,7 @@ export const StudentWorkspace: React.FC<StudentWorkspaceProps> = ({
         completedIds.push(q.id);
       }
 
-      if (isAnswerMatch(ans, q.correctAnswer)) {
+      if (isAnswerMatch(ans, q.correctAnswer, q.acceptedAnswers)) {
         correctCount += 1;
         resolvedIds.push(q.id);
         if (!completedIds.includes(q.id)) completedIds.push(q.id);
@@ -311,7 +317,7 @@ export const StudentWorkspace: React.FC<StudentWorkspaceProps> = ({
     const updatedAnswers = { ...userAnswers, [question.id]: answerValue };
     setUserAnswers(updatedAnswers);
 
-    const correct = isAnswerMatch(answerValue, question.correctAnswer);
+    const correct = isAnswerMatch(answerValue, question.correctAnswer, question.acceptedAnswers);
     const nextChecked = {
       ...checkedStatus,
       [question.id]: (correct ? "correct" : "wrong") as "correct" | "wrong",
@@ -664,7 +670,7 @@ export const StudentWorkspace: React.FC<StudentWorkspaceProps> = ({
   if (isSubmitted) {
     const total = activeQuiz.length;
     const correctCount = activeQuiz.filter((q) =>
-      isAnswerMatch(userAnswers[q.id] || "", q.correctAnswer)
+      isAnswerMatch(userAnswers[q.id] || "", q.correctAnswer, q.acceptedAnswers)
     ).length;
     const accuracy = Math.round((correctCount / total) * 100);
     const qualifiedForYt = accuracy >= 70;
@@ -729,7 +735,7 @@ export const StudentWorkspace: React.FC<StudentWorkspaceProps> = ({
             Xem lại đáp án &amp; lời giải chi tiết:
           </h3>
           {activeQuiz.map((q, idx) => {
-            const correct = isAnswerMatch(userAnswers[q.id] || "", q.correctAnswer);
+            const correct = isAnswerMatch(userAnswers[q.id] || "", q.correctAnswer, q.acceptedAnswers);
             return (
               <div
                 key={q.id}

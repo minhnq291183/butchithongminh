@@ -867,7 +867,7 @@ export default function App() {
                 onApproveAllPending={() =>
                   setQuestions((prev) =>
                     prev.map((q) =>
-                      q.status === "pending_review" ? { ...q, status: "approved" } : q
+                      q.status === "pending_review" && !q.warning ? { ...q, status: "approved" } : q
                     )
                   )
                 }

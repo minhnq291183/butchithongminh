@@ -50,10 +50,12 @@ export interface QuestionItem {
   audioText?: string;
   options: string[];
   correctAnswer: string;
+  acceptedAnswers?: string[]; // Multiple accepted answers for open fill-in questions (e.g. ['đọc', 'xem'])
   explanation: string;
   geometrySpec?: GeometrySpec;
   sourceTextbookId?: string;
   completedByChildIds?: string[]; // Tracks which children have already completed this question so they cannot farm rewards
+  warning?: string; // Yellow quality audit warning tag if validation detected potential flaw
   createdAt: string;
 }
 

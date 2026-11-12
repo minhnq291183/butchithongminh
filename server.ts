@@ -395,29 +395,173 @@ QUY TẮC QUAN TRỌNG ĐỂ KHÔNG BỊ TRÀN BỘ NHỚ JSON:
   }
 });
 
+function normalizeForComparison(str: string): string {
+  if (!str) return "";
+  return str
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[.,/#!$%^&*;:{}=\-_`~()?"'’“”[\]]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractTextbookLessons(extractedText: string): string[] {
+  if (!extractedText || !extractedText.trim()) return [""];
+  // Split by common lesson headers: Bài 1, Chương 2, Unit 3, Tiết 4, Lesson 5, or ---
+  const splitRegex = /(?=(?:Bài|Chương|Tiết|Unit|Lesson)\s+\d+)|(?:\n\s*---\s*\n)/i;
+  const rawParts = extractedText.split(splitRegex).map((p) => p.trim()).filter(Boolean);
+  if (rawParts.length >= 2) {
+    return rawParts;
+  }
+  // Otherwise split into ~2500-character coherent paragraph sections
+  const paragraphs = extractedText.split(/\n\s*\n/);
+  const chunks: string[] = [];
+  let currentChunk = "";
+  for (const p of paragraphs) {
+    if ((currentChunk + "\n\n" + p).length > 2500 && currentChunk.length > 500) {
+      chunks.push(currentChunk.trim());
+      currentChunk = p;
+    } else {
+      currentChunk = currentChunk ? `${currentChunk}\n\n${p}` : p;
+    }
+  }
+  if (currentChunk.trim()) {
+    chunks.push(currentChunk.trim());
+  }
+  return chunks.length > 0 ? chunks : [extractedText.slice(0, 4000)];
+}
+
+interface QuestionCandidate {
+  topic: string;
+  type: string;
+  questionText: string;
+  audioText?: string;
+  options: string[];
+  correctAnswer: string;
+  acceptedAnswers?: string[];
+  explanation: string;
+  geometrySpec?: any;
+  warning?: string;
+}
+
+function validateQuestionCode(
+  q: QuestionCandidate,
+  subjectId: string,
+  existingNormalizedSet: Set<string>,
+  batchNormalizedSet: Set<string>
+): { valid: boolean; fatalError?: string; warning?: string } {
+  if (!q.questionText || typeof q.questionText !== "string" || q.questionText.trim().length < 8) {
+    return { valid: false, fatalError: "Nội dung câu hỏi quá ngắn hoặc rỗng." };
+  }
+
+  const normQ = normalizeForComparison(q.questionText);
+  if (existingNormalizedSet.has(normQ) || batchNormalizedSet.has(normQ)) {
+    return { valid: false, fatalError: "Câu hỏi bị trùng lặp với câu đã có." };
+  }
+
+  // 1. Multiple choice & Geometry visual checks
+  if (
+    q.type === "multiple_choice" ||
+    q.type === "geometry_visual" ||
+    (Array.isArray(q.options) && q.options.length > 0)
+  ) {
+    if (!Array.isArray(q.options) || q.options.length < 3) {
+      return { valid: false, fatalError: "Câu trắc nghiệm phải có đủ 4 phương án lựa chọn." };
+    }
+
+    const normAns = normalizeForComparison(q.correctAnswer || "");
+    const normOptions = q.options.map((opt) => normalizeForComparison(String(opt || "")));
+
+    const ansIndex = normOptions.indexOf(normAns);
+    if (ansIndex === -1) {
+      const rawIndex = q.options.findIndex(
+        (opt) => String(opt).trim().toLowerCase() === String(q.correctAnswer).trim().toLowerCase()
+      );
+      if (rawIndex === -1) {
+        return {
+          valid: false,
+          fatalError: `Đáp án đúng '${q.correctAnswer}' không nằm trong 4 lựa chọn (${q.options.join(", ")}).`,
+        };
+      }
+    }
+
+    // Check duplicate options
+    const uniqueOptions = new Set(normOptions);
+    if (uniqueOptions.size < q.options.length) {
+      return { valid: false, fatalError: "Các phương án lựa chọn bị trùng lặp với nhau." };
+    }
+  }
+
+  // 2. Visual cue check: "nhìn hình", "xem hình", "look at the picture", "bảng" without visual
+  const visualRegex =
+    /(?:nhìn|quan sát|xem)\s+(?:hình|tranh|bức tranh|ảnh|bảng|thời khóa biểu)|look at the (?:picture|image|table)/i;
+  const hasGeo = Boolean(q.geometrySpec?.hasGeometry);
+  if (visualRegex.test(q.questionText) && !hasGeo) {
+    return {
+      valid: true,
+      warning: "Đề bài nhắc 'xem hình/bảng' nhưng câu hỏi không đính kèm hình vẽ trực quan.",
+    };
+  }
+
+  // 3. Audio leakage check
+  if (q.audioText && typeof q.audioText === "string") {
+    const isListeningTask =
+      /nghe|listen/i.test(q.questionText) && (q.type === "fill_blank" || !visualRegex.test(q.questionText));
+    const normAudio = normalizeForComparison(q.audioText);
+    const normAns = normalizeForComparison(q.correctAnswer || "");
+
+    if (!isListeningTask && normAns.length >= 3 && normAudio.includes(normAns)) {
+      return {
+        valid: true,
+        warning: `audioText (${q.audioText}) có thể làm lộ đáp án (${q.correctAnswer}).`,
+      };
+    }
+  }
+
+  // 4. English cannot have geometry calculation
+  if (subjectId === "english" && hasGeo) {
+    return {
+      valid: true,
+      warning: "Môn Tiếng Anh không nên chứa câu hỏi tính toán hình học.",
+    };
+  }
+
+  return { valid: true };
+}
+
 // 2. Generate Exam Questions from Scanned Textbook Data or Weak Topics
 app.post("/api/ai/generate-exam", async (req, res) => {
   const model = resolveModel(req.body?.model);
   try {
     const {
       subject,
+      subjectId = "math",
       grade,
       level,
       count = 5,
       textbookContent,
       preferredCategories,
       weakTopics,
+      existingQuestions = [],
+      rotationIndex = 0,
     } = req.body;
 
     const ai = getAiClient();
 
-    // Keep textbook context concise so the model focuses on generating clean JSON questions
+    // 1. Divide full textbook into lessons/sections & rotate so all chapters get covered
+    const fullText = String(textbookContent?.extractedText || "");
+    const lessons = extractTextbookLessons(fullText);
+    const activeLessonIndex =
+      typeof rotationIndex === "number" ? Math.abs(rotationIndex) % lessons.length : 0;
+    const activeLessonText = lessons[activeLessonIndex] || lessons[0] || fullText.slice(0, 4000);
+
     const compactTextbook = textbookContent
       ? {
-          title: textbookContent.title,
-          extractedText: String(textbookContent.extractedText || "").slice(0, 3500),
+          title: `${textbookContent.title || "Bài học"} (Phần ${activeLessonIndex + 1}/${lessons.length})`,
+          lessonSection: activeLessonText,
           formulasOrRules: Array.isArray(textbookContent.formulasOrRules)
-            ? textbookContent.formulasOrRules.slice(0, 10)
+            ? textbookContent.formulasOrRules.slice(0, 12)
             : [],
           sampleExercises: Array.isArray(textbookContent.sampleExercises)
             ? textbookContent.sampleExercises.slice(0, 8)
@@ -425,10 +569,29 @@ app.post("/api/ai/generate-exam", async (req, res) => {
         }
       : {};
 
+    // 2. Anti-duplication: build normalized set of existing questions
+    const existingNormalizedSet = new Set<string>();
+    const existingSummaryList: string[] = [];
+
+    if (Array.isArray(existingQuestions)) {
+      existingQuestions.forEach((q: any) => {
+        if (q && q.questionText) {
+          const norm = normalizeForComparison(String(q.questionText));
+          existingNormalizedSet.add(norm);
+          const ansSnippet = q.correctAnswer ? ` -> Đáp án: "${q.correctAnswer}"` : "";
+          existingSummaryList.push(`- ${q.questionText.slice(0, 90)}${ansSnippet}`);
+        }
+      });
+    }
+
     const levelInstruction =
       level === "advanced"
-        ? `MỨC NÂNG CAO (Tư duy mở rộng): Tạo câu hỏi phát triển tư duy logic, bài toán có lời văn 2 bước tính, bài toán ghép hình hoặc tìm cạnh chưa biết từ chu vi/diện tích, hoặc câu hỏi vận dụng sâu nhưng TUYỆT ĐỐI nằm trong phạm vi kiến thức Lớp ${grade} đã học trong tài liệu.`
-        : `MỨC CƠ BẢN (Biến đổi số liệu): Tạo câu hỏi bám sát 100% cấu trúc bài tập mẫu trong sách giáo khoa đã lưu, chỉ thay đổi con số, kích thước cạnh, tên đồ vật/nhân vật để bé rèn kỹ năng chuẩn xác.`;
+        ? `MỨC NÂNG CAO (advanced - Đòi hỏi tư duy phân tích, tổng hợp sâu hơn hẳn mức cơ bản):
+* Môn Tiếng Việt: Phân loại từ (từ chỉ sự vật, hoạt động, đặc điểm), tìm và sửa lỗi sai chính tả/ngữ pháp trong câu, điền từ thích hợp vào đoạn văn ngắn 2-3 câu, tìm cặp từ đồng nghĩa/trái nghĩa.
+* Môn Tiếng Anh: Đọc hiểu đoạn văn ngắn 2-3 câu rồi trả lời, tìm lỗi sai ngữ pháp trong câu, chọn cặp từ trái nghĩa.
+* Môn Toán: Bài toán giải bằng 2 bước tính, suy luận hình học ngược (biết chu vi tìm cạnh, diện tích phần ghép/khuyết).
+TUYỆT ĐỐI KHÔNG dùng kiến thức lớp 1 tầm thường (như đếm 1-5 hay nhận biết 1 chữ cái đơn giản).`
+        : `MỨC CƠ BẢN (Biến đổi số liệu & vận dụng chuẩn mực): Tạo câu hỏi bám sát 100% cấu trúc bài tập trong sách giáo khoa đã lưu, chỉ thay đổi con số, kích thước cạnh, tên đồ vật/nhân vật để bé rèn kỹ năng chuẩn xác.`;
 
     const weakTopicContext =
       Array.isArray(weakTopics) && weakTopics.length > 0
@@ -440,111 +603,256 @@ app.post("/api/ai/generate-exam", async (req, res) => {
         ? `\nCÁC CÔNG THỨC, QUY TẮC & DẠNG BÀI TRỌNG TÂM CẦN RA ĐỀ (trích từ OCR bài học): ${preferredCategories.join(" | ")}.`
         : "";
 
-    const prompt = `Bạn là giáo viên tiểu học giỏi tại Việt Nam đang ra đề cho học sinh Lớp ${grade}, môn ${subject}.
-Hãy dựa vào dữ liệu sách giáo khoa đã lưu dưới đây để tạo đúng ${count} câu hỏi chất lượng cao, bám sát đúng đặc thù môn học và các công thức/quy tắc đã chọn.
+    const existingContext =
+      existingSummaryList.length > 0
+        ? `\nDANH SÁCH CÂU ĐÃ CÓ TRONG KHO (TUYỆT ĐỐI KHÔNG TẠO TRÙNG HOẶC CÙNG DẠNG/CÙNG TỪ ĐÁP ÁN VỚI CÁC CÂU NÀY):\n${existingSummaryList.slice(0, 45).join("\n")}`
+        : "";
+
+    const questionSchema = {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          topic: {
+            type: Type.STRING,
+            description: "Chuyên đề ngắn gọn, ví dụ: 'Tính chu vi hình chữ nhật'",
+          },
+          type: {
+            type: Type.STRING,
+            description: "Loại câu hỏi: 'geometry_visual', 'multiple_choice', 'fill_blank', 'true_false', hoặc 'ordering'",
+          },
+          questionText: {
+            type: Type.STRING,
+            description: "Nội dung câu hỏi rõ ràng, tự đủ dữ kiện 100%.",
+          },
+          audioText: {
+            type: Type.STRING,
+            description: "Từ hoặc câu tiếng Anh/tiếng Việt để đọc thành tiếng khi bé bấm loa.",
+          },
+          options: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: "Các phương án lựa chọn (4 đáp án cho trắc nghiệm, hoặc rỗng cho fill_blank).",
+          },
+          correctAnswer: {
+            type: Type.STRING,
+            description: "Đáp án đúng chính xác.",
+          },
+          acceptedAnswers: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: "Danh sách các từ đồng nghĩa được chấp nhận cho câu điền từ mở.",
+          },
+          explanation: {
+            type: Type.STRING,
+            description: "Lời giải ngắn gọn 1-2 câu dễ hiểu cho bé.",
+          },
+          geometrySpec: {
+            type: Type.OBJECT,
+            properties: {
+              hasGeometry: { type: Type.BOOLEAN },
+              shapeType: { type: Type.STRING },
+              width: { type: Type.NUMBER },
+              height: { type: Type.NUMBER },
+              topWidth: { type: Type.NUMBER },
+              sideA: { type: Type.NUMBER },
+              sideB: { type: Type.NUMBER },
+              sideC: { type: Type.NUMBER },
+              unit: { type: Type.STRING },
+              showGrid: { type: Type.BOOLEAN },
+              taskFocus: { type: Type.STRING },
+              customLabel: { type: Type.STRING },
+            },
+          },
+        },
+        required: ["topic", "type", "questionText", "options", "correctAnswer", "explanation"],
+      },
+    };
+
+    // Helper to generate a batch of questions
+    const generateBatch = async (requestCount: number, forbiddenList: string[] = []) => {
+      const prompt = `Bạn là giáo viên tiểu học giỏi tại Việt Nam đang ra đề cho học sinh Lớp ${grade}, môn ${subject}.
+Hãy dựa vào dữ liệu sách giáo khoa dưới đây để tạo đúng ${requestCount} câu hỏi chất lượng cao.
 
 ${levelInstruction}
 ${weakTopicContext}
 ${categoryContext}
+${existingContext}
+${forbiddenList.length > 0 ? `\nCÁC CÂU VỪA TẠO TRONG ĐỢT NÀY (KHÔNG ĐƯỢC LẶP LẠI TỪ VỰNG HOẶC ĐÁP ÁN):\n${forbiddenList.join("\n")}` : ""}
 
-Dữ liệu sách giáo khoa gốc:
+Dữ liệu sách giáo khoa (Đang xoay vòng Bài/Phần ${activeLessonIndex + 1}/${lessons.length}):
 ${JSON.stringify(compactTextbook, null, 2)}
 
-Quy tắc quan trọng (Giữ văn bản ngắn gọn, tuyệt đối không lặp từ để đảm bảo JSON hợp lệ):
-1. CHỈ KHI môn học là Toán ("math") VÀ câu hỏi thuộc dạng HÌNH HỌC (nhận biết hình, đếm cạnh/đỉnh/góc, tính chu vi, diện tích), mới đặt type = "geometry_visual" và cung cấp "geometrySpec":
-   - hasGeometry: true
-   - shapeType: chọn 1 trong ["rectangle", "square", "triangle", "right_triangle", "trapezoid", "parallelogram", "pentagon", "hexagon", "circle", "composite_l"]
-   - width: chiều dài / đáy (số nguyên, ví dụ 8)
-   - height: chiều rộng / chiều cao (ví dụ 5)
-   - topWidth: đáy nhỏ (nếu là hình thang, ví dụ 4)
-   - sideA, sideB, sideC: độ dài các cạnh (nếu là tam giác hoặc đa giác)
-   - unit: đơn vị đo (ví dụ "cm", "dm", "m")
-   - showGrid: true
-   - taskFocus: chọn 1 trong ["identify_shape", "count_sides", "perimeter", "area"]
-   - customLabel: nhãn ngắn gọn hiển thị trên hình (tối đa 30 ký tự, ví dụ "Hình chữ nhật ABCD")
-   Với các môn Tiếng Việt, Tiếng Anh, Khoa học hoặc Toán số học thông thường, hãy đặt hasGeometry: false và dùng type = "multiple_choice" hoặc "fill_blank".
-2. Nếu là dạng trắc nghiệm ("multiple_choice" hoặc "geometry_visual"), mảng "options" phải có đúng 4 phương án rõ ràng, và "correctAnswer" phải khớp chính xác 100% với 1 trong 4 phương án đó.
-3. Nếu là dạng điền kết quả ("fill_blank"), "options" để mảng rỗng [], "correctAnswer" chỉ ghi con số hoặc từ cần điền.
-4. Nếu là môn Tiếng Anh hoặc câu hỏi Luyện nghe phát âm (có trường "audioText"):
-   - Trường "audioText" chứa từ hoặc câu cần phát âm (ví dụ: "zebra").
-   - TUYỆT ĐỐI KHÔNG viết lộ đáp án ("correctAnswer") vào trong "questionText" nếu đó là bài nghe điền từ! Hãy viết câu dẫn gợi mở hoặc dịch nghĩa tiếng Việt để bé tự nghe loa và suy nghĩ (ví dụ: "Bấm nút Nghe phát âm và viết lại từ tiếng Anh chỉ 'con ngựa vằn' mà em nghe được:").
-5. Giải thích ("explanation") viết ngắn gọn 1–2 câu (tối đa 200 ký tự), dễ hiểu cho học sinh Lớp ${grade}.`;
+LUẬT RA ĐỀ BẮT BUỘC (TUÂN THỦ 100%):
+1. TỰ ĐỦ DỮ KIỆN: Mỗi câu hỏi PHẢI TỰ ĐỦ 100% DỮ KIỆN để học sinh giải được. CẤM TUYỆT ĐỐI các câu 'Look at the picture', 'Xem hình', 'Dựa vào bảng/thời khóa biểu' nếu không có hình vẽ thật trong geometrySpec hoặc đoạn văn trong đề. Toán có lời văn phải đủ số liệu tính toán.
+2. ĐÚNG DUY NHẤT 1 ĐÁP ÁN: Trắc nghiệm phải có ĐÚNG MỘT đáp án đúng. Phải xét kỹ viết tắt ('She is' vs 'She\\'s'), mạo từ ('a'/'an'/'the'), chữ hoa/thường ('Bạn nam' vs 'Bạn Nam'). Ba đáp án nhiễu phải sai thật sự và không trùng nhau.
+3. ĐIỀN TỪ MỞ: Nếu câu hỏi có nhiều từ cùng có thể đúng ('đang ... sách', 'rất ...'), hãy chuyển sang trắc nghiệm 4 đáp án HOẶC cung cấp mảng "acceptedAnswers" chứa các từ đồng nghĩa (ví dụ: ["đọc", "xem"]).
+4. KHÔNG HỎI DỮ KIỆN TÙY Ý: Không hỏi tuổi, tên người tùy ý mà bài đọc không nêu.
+5. SẮP XẾP TỪ THÀNH CÂU: Mảng "options" PHẢI LÀ 4 CÂU HOÀN CHỈNH (1 câu đúng ngữ pháp, 3 câu sai trật tự từ để học sinh chọn), KHÔNG ĐỂ options là từng từ rời.
+6. ĐIỀN ÂM/VẦN (Tiếng Việt): Dấu chấm lửng '...' phải thay thế đúng âm/vần. Khi ghép đáp án vào PHẢI TẠO THÀNH TỪ CÓ NGHĨA chuẩn chính tả tiếng Việt quen thuộc với học sinh lớp ${grade}.
+7. XẾP CHỮ CÁI THÀNH TỪ (Tiếng Anh): Kiểm tra đủ và đúng từng chữ cái 1-1, không thừa thiếu chữ.
+8. MÔN TIẾNG ANH: TUYỆT ĐỐI KHÔNG ra câu hỏi hình học (chu vi, diện tích). Môn Toán có hình thì số đo trên hình phải khớp đề và không ghi sẵn đáp án lên hình.
+9. AUDIO TEXT: Với câu ngữ pháp/chính tả CHỈ ĐỌC ĐỀ BÀI, KHÔNG CHỨA ĐÁP ÁN. Chỉ riêng câu nghe điền từ mới đọc từ cần điền (và khi đó questionText không được viết lộ từ đó ra).
+10. ĐA DẠNG: Mỗi câu trong ${requestCount} câu phải thuộc dạng bài hoặc chủ đề khác nhau. Mỗi từ vựng hoặc số liệu đáp án chỉ xuất hiện 1 lần.`;
 
-    const response = await ai.models.generateContent({
-      model,
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              topic: {
-                type: Type.STRING,
-                description: "Chuyên đề ngắn gọn, ví dụ: 'Tính chu vi hình chữ nhật'",
-              },
-              type: {
-                type: Type.STRING,
-                description: "Loại câu hỏi: 'geometry_visual', 'multiple_choice', 'fill_blank', 'true_false', hoặc 'ordering'",
-              },
-              questionText: {
-                type: Type.STRING,
-                description: "Nội dung câu hỏi rõ ràng cho học sinh tiểu học.",
-              },
-              audioText: {
-                type: Type.STRING,
-                description: "Từ hoặc câu tiếng Anh/tiếng Việt để đọc thành tiếng khi bé bấm loa.",
-              },
-              options: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: "Các phương án lựa chọn (4 đáp án cho trắc nghiệm, hoặc rỗng cho fill_blank).",
-              },
-              correctAnswer: {
-                type: Type.STRING,
-                description: "Đáp án đúng chính xác.",
-              },
-              explanation: {
-                type: Type.STRING,
-                description: "Lời giải ngắn gọn 1-2 câu dễ hiểu cho bé.",
-              },
-              geometrySpec: {
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: questionSchema,
+        },
+      });
+
+      return repairAndParseJson<QuestionCandidate[]>(response.text ?? "[]", "array");
+    };
+
+    // 3. First-pass generation
+    let rawQuestions = await generateBatch(count);
+    if (!Array.isArray(rawQuestions)) rawQuestions = [];
+
+    const batchNormalizedSet = new Set<string>();
+    const batchAnswerSet = new Set<string>();
+    const verifiedQuestions: QuestionCandidate[] = [];
+
+    // 4. Code-based validation & deduplication
+    for (const q of rawQuestions) {
+      if (!q) continue;
+      const codeCheck = validateQuestionCode(q, String(subjectId), existingNormalizedSet, batchNormalizedSet);
+      if (!codeCheck.valid) {
+        continue; // Discard invalid or duplicate question
+      }
+
+      // Check unique answer key in this batch
+      const normAns = normalizeForComparison(q.correctAnswer || "");
+      if (normAns.length > 1 && batchAnswerSet.has(normAns) && q.type !== "true_false") {
+        continue; // Skip duplicate vocabulary/answer in same batch
+      }
+
+      batchNormalizedSet.add(normalizeForComparison(q.questionText));
+      if (normAns.length > 1) batchAnswerSet.add(normAns);
+
+      if (codeCheck.warning) {
+        q.warning = codeCheck.warning;
+      }
+      verifiedQuestions.push(q);
+    }
+
+    // 5. Compensation refill loop (if any duplicates or invalid items were discarded)
+    if (verifiedQuestions.length < count) {
+      const missingCount = count - verifiedQuestions.length;
+      try {
+        const forbiddenSnippets = verifiedQuestions.map(
+          (q) => `- ${q.questionText.slice(0, 80)} (Đáp án: ${q.correctAnswer})`
+        );
+        const refillRaw = await generateBatch(missingCount, forbiddenSnippets);
+
+        if (Array.isArray(refillRaw)) {
+          for (const q of refillRaw) {
+            if (verifiedQuestions.length >= count) break;
+            const codeCheck = validateQuestionCode(
+              q,
+              String(subjectId),
+              existingNormalizedSet,
+              batchNormalizedSet
+            );
+            if (!codeCheck.valid) continue;
+
+            const normAns = normalizeForComparison(q.correctAnswer || "");
+            if (normAns.length > 1 && batchAnswerSet.has(normAns) && q.type !== "true_false") continue;
+
+            batchNormalizedSet.add(normalizeForComparison(q.questionText));
+            if (normAns.length > 1) batchAnswerSet.add(normAns);
+
+            if (codeCheck.warning) q.warning = codeCheck.warning;
+            verifiedQuestions.push(q);
+          }
+        }
+      } catch (refillErr) {
+        console.warn("Compensation refill warning:", refillErr);
+      }
+    }
+
+    // 6. Second-pass AI Auditor (Thẩm định chất lượng từng câu)
+    if (verifiedQuestions.length > 0) {
+      try {
+        const auditItems = verifiedQuestions.map((q, idx) => ({
+          index: idx,
+          questionText: q.questionText,
+          options: q.options,
+          correctAnswer: q.correctAnswer,
+          audioText: q.audioText || "",
+        }));
+
+        const auditPrompt = `Bạn là Chuyên gia Khảo thí và Kiểm định Đề thi Tiểu học Việt Nam.
+Hãy thẩm định danh sách ${auditItems.length} câu hỏi sau theo 4 tiêu chí nghiêm ngặt:
+1. ĐÁP ÁN: Đáp án đúng có chuẩn xác 100% không?
+2. TÍNH DUY NHẤT: Trắc nghiệm có ĐÚNG DUY NHẤT 1 đáp án không? (Xét cả viết tắt, mạo từ, chữ hoa/thường).
+3. ĐỦ DỮ KIỆN: Đề bài có tự đủ 100% dữ kiện không? (Có bị thiếu số liệu hoặc nhắc 'nhìn hình/bảng' mà không có không?).
+4. LỘ ĐÁP ÁN: Đề bài hoặc audioText có vô tình viết lộ đáp án ra không?
+
+Danh sách câu hỏi cần thẩm định:
+${JSON.stringify(auditItems, null, 2)}
+
+Trả về mảng JSON đánh giá từng câu:
+- index (số nguyên từ 0)
+- passed (boolean: true nếu câu hợp lệ; false nếu sai kiến thức, 2 đáp án cùng đúng, hoặc thiếu dữ kiện nghiêm trọng)
+- warning (chuỗi cảnh báo ngắn gọn nếu có điểm cần phụ huynh lưu ý, hoặc để trống "")`;
+
+        const auditResponse = await ai.models.generateContent({
+          model,
+          contents: auditPrompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
                 type: Type.OBJECT,
                 properties: {
-                  hasGeometry: { type: Type.BOOLEAN },
-                  shapeType: { type: Type.STRING },
-                  width: { type: Type.NUMBER },
-                  height: { type: Type.NUMBER },
-                  topWidth: { type: Type.NUMBER },
-                  sideA: { type: Type.NUMBER },
-                  sideB: { type: Type.NUMBER },
-                  sideC: { type: Type.NUMBER },
-                  unit: { type: Type.STRING },
-                  showGrid: { type: Type.BOOLEAN },
-                  taskFocus: { type: Type.STRING },
-                  customLabel: { type: Type.STRING },
+                  index: { type: Type.INTEGER },
+                  passed: { type: Type.BOOLEAN },
+                  warning: { type: Type.STRING },
+                  reason: { type: Type.STRING },
                 },
+                required: ["index", "passed"],
               },
             },
-            required: ["topic", "type", "questionText", "options", "correctAnswer", "explanation"],
           },
-        },
-      },
-    });
+        });
 
-    const questions = repairAndParseJson<unknown[]>(response.text ?? "[]", "array");
+        const auditList = repairAndParseJson<Array<{ index: number; passed: boolean; warning?: string }>>(
+          auditResponse.text ?? "[]",
+          "array"
+        );
 
-    if (!Array.isArray(questions) || questions.length === 0) {
+        if (Array.isArray(auditList)) {
+          auditList.forEach((aud) => {
+            const targetQ = verifiedQuestions[aud.index];
+            if (targetQ) {
+              if (aud.passed === false) {
+                targetQ.warning =
+                  targetQ.warning || aud.warning || "Câu hỏi bị AI thẩm định đánh giá chưa đạt chuẩn kiến thức.";
+              } else if (aud.warning && aud.warning.trim()) {
+                targetQ.warning = aud.warning.trim();
+              }
+            }
+          });
+        }
+      } catch (auditErr) {
+        console.warn("AI Auditor pass skipped due to timeout or parse error:", auditErr);
+      }
+    }
+
+    if (verifiedQuestions.length === 0) {
       res.status(500).json({
-        error: `Model '${model}' trả về danh sách câu hỏi rỗng (0 câu).`,
-        hint: "Hãy thử đổi sang model 'gemini-3.8-flash' hoặc 'gemini-flash-latest' và chọn 3–5 câu rồi bấm tạo lại.",
+        error: `Model '${model}' không sinh được câu hỏi nào đạt chuẩn (0 câu).`,
+        hint: "Hãy thử đổi sang model 'gemini-3.8-flash' hoặc 'gemini-4-argon' và bấm tạo lại.",
         modelUsed: model,
       });
       return;
     }
 
-    res.json({ questions, modelUsed: model });
+    res.json({ questions: verifiedQuestions, modelUsed: model });
   } catch (error: unknown) {
     console.error("Error in /api/ai/generate-exam:", error);
     const formatted = formatGeminiError(error, model);
