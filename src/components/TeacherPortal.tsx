@@ -139,8 +139,9 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
     textbooks[0] || null
   );
 
-  // 2. AI Exam Generator State + Dynamic Categories from Scanned Textbook OCR
-  const [genTextbookId, setGenTextbookId] = useState<string>(textbooks[0]?.id || "");
+  // 2. AI Exam Generator State + Subject Selector & Dynamic Categories from Scanned Textbook OCR
+  const [genSubject, setGenSubject] = useState<SubjectId | "all">("math");
+  const [genTextbookId, setGenTextbookId] = useState<string>("");
   const [genLevel, setGenLevel] = useState<QuestionLevel>("basic");
   const [genCount, setGenCount] = useState<number>(10);
   const [genCategories, setGenCategories] = useState<string[]>([]);
@@ -153,50 +154,121 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
   const [genError, setGenError] = useState<{ error: string; hint?: string } | null>(null);
   const [genSuccessMessage, setGenSuccessMessage] = useState<string | null>(null);
 
+  // Filter textbooks according to selected subject
+  const availableGenTextbooks = useMemo(() => {
+    if (genSubject === "all") return textbooks;
+    return textbooks.filter((t) => t.subject === genSubject);
+  }, [textbooks, genSubject]);
+
+  // Auto-sync genTextbookId when available textbooks change
+  useEffect(() => {
+    if (availableGenTextbooks.length > 0) {
+      if (!availableGenTextbooks.some((t) => t.id === genTextbookId)) {
+        setGenTextbookId(availableGenTextbooks[0].id);
+      }
+    } else {
+      setGenTextbookId("");
+    }
+  }, [availableGenTextbooks, genTextbookId]);
+
   // Selected textbook for AI Exam Generator
   const currentSelectedTextbook = useMemo(
-    () => textbooks.find((t) => t.id === genTextbookId) || textbooks[0] || null,
-    [textbooks, genTextbookId]
+    () => textbooks.find((t) => t.id === genTextbookId) || availableGenTextbooks[0] || null,
+    [textbooks, genTextbookId, availableGenTextbooks]
   );
+
+  // Client-side clone detection helpers
+  const extractClientNumSig = (text: string): string => {
+    const nums = (text.match(/\d+(?:[.,]\d+)?/g) || [])
+      .map((n) => parseFloat(n.replace(",", ".")))
+      .filter((n) => !isNaN(n))
+      .sort((a, b) => a - b);
+    return nums.join("_");
+  };
+
+  const extractClientSkel = (text: string): string => {
+    return text
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[.,/#!$%^&*;:{}=\-_`~()?"'’“”[\]]/g, "")
+      .replace(/\d+(?:[.,]\d+)?/g, "#NUM#")
+      .replace(
+        /\b(?:lit|lít|l|kg|kilogam|g|gam|cm|dm|m|km|can|thung|thùng|be|bể|tui|túi|bao|goi|gói|chai|dau|dầu|xang|xăng|sua|sữa|nuoc|nước|mat|mật|gao|gạo|duong|đường|muoi|muối|cam|tao|táo|but|bút|vo|vở|thuoc|thước|hoc sinh|học sinh|ban|bạn|bong hoa|bông hoa|vien bi|viên bi|nam|hoa|lan|minh|hung|hùng|an|binh|bình|chi|ha|hà|linh)\b/g,
+        "#ENTITY#"
+      )
+      .replace(/\s+/g, " ")
+      .trim();
+  };
+
+  const isClientCloneOf = (q1Text: string, q2Text: string): boolean => {
+    if (!q1Text || !q2Text) return false;
+    const sig1 = extractClientNumSig(q1Text);
+    const sig2 = extractClientNumSig(q2Text);
+    if (sig1 && sig2 && sig1 === sig2 && sig1.includes("_")) {
+      const skel1 = extractClientSkel(q1Text);
+      const skel2 = extractClientSkel(q2Text);
+      if (skel1 === skel2) return true;
+      const w1 = new Set(skel1.split(" "));
+      const w2 = new Set(skel2.split(" "));
+      let common = 0;
+      for (const w of w1) {
+        if (w2.has(w)) common++;
+      }
+      const overlap = common / Math.max(w1.size, w2.size);
+      if (overlap >= 0.7) return true;
+    }
+    return false;
+  };
+
+  const approvedQuestionPool = useMemo(
+    () => questions.filter((q) => q.status === "approved"),
+    [questions]
+  );
+
+  const isQuestionACloneOfApproved = (targetQ: QuestionItem) => {
+    return approvedQuestionPool.some(
+      (ex) => ex.id !== targetQ.id && isClientCloneOf(targetQ.questionText, ex.questionText)
+    );
+  };
 
   // Dynamically build the available categories/rules/concepts directly from the scanned textbook JSON!
   const dynamicTextbookCategories = useMemo(() => {
-    if (!currentSelectedTextbook) return [];
     const items = new Set<string>();
 
-    // 1. Pull all Formulas / Rules extracted by OCR from this textbook
-    currentSelectedTextbook.formulasOrRules?.forEach((rule) => {
-      if (rule && rule.trim()) items.add(rule.trim());
-    });
+    if (currentSelectedTextbook) {
+      currentSelectedTextbook.formulasOrRules?.forEach((rule) => {
+        if (rule && rule.trim()) items.add(rule.trim());
+      });
 
-    // 2. Pull Key Concepts extracted by OCR from this textbook
-    currentSelectedTextbook.keyConcepts?.forEach((concept) => {
-      if (concept && concept.trim()) items.add(concept.trim());
-    });
+      currentSelectedTextbook.keyConcepts?.forEach((concept) => {
+        if (concept && concept.trim()) items.add(concept.trim());
+      });
 
-    // 3. Pull Sample Exercise Topic Tags extracted by OCR
-    currentSelectedTextbook.sampleExercises?.forEach((ex) => {
-      if (ex.topicTag && ex.topicTag.trim()) items.add(ex.topicTag.trim());
-    });
+      currentSelectedTextbook.sampleExercises?.forEach((ex) => {
+        if (ex.topicTag && ex.topicTag.trim()) items.add(ex.topicTag.trim());
+      });
+    }
 
-    // 4. Add subject-appropriate question formats
+    // Add subject-appropriate question formats
     items.add("Dạng: Trắc nghiệm 4 đáp án");
-    items.add("Dạng: Điền từ / Điền kết quả vào chỗ trống");
-    if (
-      currentSelectedTextbook.subject === "vietnamese" ||
-      currentSelectedTextbook.subject === "english"
-    ) {
+    items.add("Dạng: Điền kết quả vào chỗ trống");
+
+    const isAll = genSubject === "all";
+    const subj = currentSelectedTextbook?.subject;
+
+    if (isAll || subj === "vietnamese" || subj === "english") {
       items.add("Dạng: Sắp xếp các từ thành câu hoàn chỉnh");
     }
-    if (currentSelectedTextbook.subject === "english") {
+    if (isAll || subj === "english") {
       items.add("Dạng: Nghe phát âm Tiếng Anh và chọn/điền đáp án");
     }
-    if (currentSelectedTextbook.subject === "math") {
-      items.add("Dạng: Toán có hình vẽ minh họa trực quan (SVG)");
+    if (isAll || subj === "math") {
+      items.add("Dạng: Toán có hình vẽ minh họa trực quan (SVG chuẩn)");
     }
 
     return Array.from(items);
-  }, [currentSelectedTextbook]);
+  }, [currentSelectedTextbook, genSubject]);
 
   // Whenever the teacher switches to a different textbook, automatically select its scanned rules & concepts!
   useEffect(() => {
@@ -462,13 +534,18 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
             : `Model ${selectedModel} đang thiết kế ${currentBatchCount} câu hỏi sát theo dữ liệu SGK...`
         );
 
+        const chosenSubjectMeta =
+          genSubject === "all"
+            ? { label: "Tất cả các môn" }
+            : SUBJECT_META[genSubject] || { label: "Toán" };
+
         const res = await fetch("/api/ai/generate-exam", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: selectedModel,
-            subject: targetTb ? SUBJECT_META[targetTb.subject].label : "Toán",
-            subjectId: targetTb?.subject || "math",
+            subject: targetTb ? SUBJECT_META[targetTb.subject].label : chosenSubjectMeta.label,
+            subjectId: genSubject,
             grade: targetTb?.grade || grade,
             level: genLevel,
             count: currentBatchCount,
@@ -511,43 +588,76 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
         const rawList = Array.isArray(data.questions) ? data.questions : [];
         if (rawList.length > 0) {
           const createdItems: QuestionItem[] = rawList.map(
-            (item: Partial<QuestionItem> & { geometrySpec?: GeometrySpec; warning?: string; acceptedAnswers?: string[] }, idx: number) => ({
-              id: `q-ai-${Date.now()}-${batchIndex}-${idx}`,
-              subject: targetTb?.subject || "math",
-              grade: targetTb?.grade || grade,
-              topic: item.topic || "Kiến thức trọng tâm",
-              level: genLevel,
-              type: (item.type as QuestionType) || "multiple_choice",
-              status: "pending_review",
-              questionText: item.questionText || "",
-              audioText: item.audioText || undefined,
-              options: Array.isArray(item.options) ? item.options : [],
-              correctAnswer: String(item.correctAnswer || ""),
-              acceptedAnswers: Array.isArray(item.acceptedAnswers) ? item.acceptedAnswers : undefined,
-              explanation: item.explanation || "",
-              warning: item.warning || undefined,
-              geometrySpec:
-                item.geometrySpec &&
-                (item.geometrySpec.hasGeometry || item.type === "geometry_visual")
-                  ? {
-                      hasGeometry: true,
-                      shapeType: (item.geometrySpec.shapeType as ShapeType) || "rectangle",
-                      width: item.geometrySpec.width || 8,
-                      height: item.geometrySpec.height || 5,
-                      topWidth: item.geometrySpec.topWidth || 4,
-                      sideA: item.geometrySpec.sideA || 6,
-                      sideB: item.geometrySpec.sideB || 8,
-                      sideC: item.geometrySpec.sideC || 10,
-                      unit: item.geometrySpec.unit || "cm",
-                      showGrid: item.geometrySpec.showGrid ?? true,
-                      taskFocus: item.geometrySpec.taskFocus || "perimeter",
-                      customLabel: item.geometrySpec.customLabel || item.topic,
-                    }
-                  : undefined,
-              sourceTextbookId: targetTb?.id,
-              completedByChildIds: [],
-              createdAt: new Date().toISOString(),
-            })
+            (
+              item: Partial<QuestionItem> & {
+                subject?: string;
+                geometrySpec?: GeometrySpec;
+                warning?: string;
+                acceptedAnswers?: string[];
+              },
+              idx: number
+            ) => {
+              let assignedSubject: SubjectId = "math";
+              if (genSubject === "all") {
+                if (
+                  item.subject &&
+                  ["math", "vietnamese", "english", "science"].includes(item.subject)
+                ) {
+                  assignedSubject = item.subject as SubjectId;
+                } else {
+                  const checkStr = ((item.topic || "") + " " + (item.questionText || "")).toLowerCase();
+                  if (/tiếng anh|english|choose the|listen|what is/i.test(checkStr)) {
+                    assignedSubject = "english";
+                  } else if (/tiếng việt|chính tả|tập đọc|từ chỉ|vần/i.test(checkStr)) {
+                    assignedSubject = "vietnamese";
+                  } else if (/khoa học|tự nhiên|xã hội|môi trường/i.test(checkStr)) {
+                    assignedSubject = "science";
+                  } else {
+                    assignedSubject = targetTb?.subject || "math";
+                  }
+                }
+              } else {
+                assignedSubject = genSubject;
+              }
+
+              return {
+                id: `q-ai-${Date.now()}-${batchIndex}-${idx}`,
+                subject: assignedSubject,
+                grade: targetTb?.grade || grade,
+                topic: item.topic || "Kiến thức trọng tâm",
+                level: genLevel,
+                type: (item.type as QuestionType) || "multiple_choice",
+                status: "pending_review",
+                questionText: item.questionText || "",
+                audioText: item.audioText || undefined,
+                options: Array.isArray(item.options) ? item.options : [],
+                correctAnswer: String(item.correctAnswer || ""),
+                acceptedAnswers: Array.isArray(item.acceptedAnswers) ? item.acceptedAnswers : undefined,
+                explanation: item.explanation || "",
+                warning: item.warning || undefined,
+                geometrySpec:
+                  item.geometrySpec &&
+                  (item.geometrySpec.hasGeometry || item.type === "geometry_visual")
+                    ? {
+                        hasGeometry: true,
+                        shapeType: (item.geometrySpec.shapeType as ShapeType) || "rectangle",
+                        width: item.geometrySpec.width || 8,
+                        height: item.geometrySpec.height || 5,
+                        topWidth: item.geometrySpec.topWidth || 4,
+                        sideA: item.geometrySpec.sideA || 6,
+                        sideB: item.geometrySpec.sideB || 8,
+                        sideC: item.geometrySpec.sideC || 10,
+                        unit: item.geometrySpec.unit || "cm",
+                        showGrid: item.geometrySpec.showGrid ?? true,
+                        taskFocus: item.geometrySpec.taskFocus || "perimeter",
+                        customLabel: item.geometrySpec.customLabel || item.topic,
+                      }
+                    : undefined,
+                sourceTextbookId: targetTb?.id,
+                completedByChildIds: [],
+                createdAt: new Date().toISOString(),
+              };
+            }
           );
 
           onAddQuestions(createdItems);
@@ -876,14 +986,17 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               </button>
 
               {(() => {
-                const validPending = pendingQuestions.filter((q) => !q.warning);
-                const warnedPending = pendingQuestions.filter((q) => Boolean(q.warning));
+                const isClone = (targetQ: QuestionItem) => isQuestionACloneOfApproved(targetQ);
+                const validPending = pendingQuestions.filter((q) => !q.warning && !isClone(q));
+                const warnedOrClonePending = pendingQuestions.filter(
+                  (q) => Boolean(q.warning) || isClone(q)
+                );
 
                 return (
                   <div className="flex flex-wrap items-center gap-2">
-                    {warnedPending.length > 0 && (
+                    {warnedOrClonePending.length > 0 && (
                       <span className="px-2.5 py-1.5 rounded-lg bg-amber-50 border border-amber-300 text-amber-900 text-xs font-semibold">
-                        ⚠️ {warnedPending.length} câu có cảnh báo (phải duyệt riêng)
+                        ⚠️ {warnedOrClonePending.length} câu có cảnh báo hoặc trùng dạng (duyệt riêng)
                       </span>
                     )}
 
@@ -1058,22 +1171,32 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
                               : "lg:col-span-12 space-y-3"
                           }
                         >
-                          {item.warning && (
-                            <div className="p-3 rounded-xl bg-amber-50 border-2 border-amber-300 text-amber-950 text-xs font-bold flex items-start gap-2.5">
-                              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                              <div className="space-y-0.5">
-                                <span className="font-extrabold uppercase text-[10px] text-amber-800 tracking-wide block">
-                                  ⚠️ Cảnh báo chất lượng từ hệ thống kiểm tra &amp; AI:
-                                </span>
-                                <span className="font-semibold text-amber-900 leading-relaxed">
-                                  {item.warning}
-                                </span>
-                                <p className="text-[11px] text-amber-700 font-normal">
-                                  (Câu này bị loại khỏi "Duyệt tất cả". Bố mẹ hãy bấm "Chỉnh sửa câu" hoặc kiểm tra kỹ trước khi bấm "Duyệt câu này")
-                                </p>
+                          {(() => {
+                            const isClone = isQuestionACloneOfApproved(item);
+                            if (!item.warning && !isClone) return null;
+
+                            return (
+                              <div className="p-3 rounded-xl bg-amber-50 border-2 border-amber-300 text-amber-950 text-xs font-bold flex items-start gap-2.5">
+                                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                                <div className="space-y-0.5">
+                                  <span className="font-extrabold uppercase text-[10px] text-amber-800 tracking-wide block">
+                                    ⚠️ {isClone ? "Trùng dạng bài / Cảnh báo chất lượng:" : "Cảnh báo chất lượng:"}
+                                  </span>
+                                  <span className="font-semibold text-amber-900 leading-relaxed block">
+                                    {isClone && (
+                                      <span className="text-amber-900 font-bold block mb-1">
+                                        • Trùng bộ số liệu và cấu trúc với câu đã có trong kho đề (trùng dạng).
+                                      </span>
+                                    )}
+                                    {item.warning && <span>• {item.warning}</span>}
+                                  </span>
+                                  <p className="text-[11px] text-amber-700 font-normal">
+                                    (Câu này bị loại khỏi &quot;Duyệt các câu đạt chuẩn&quot;. Bố mẹ hãy bấm &quot;Chỉnh sửa câu&quot;, &quot;Loại bỏ&quot; hoặc bấm &quot;Duyệt câu này&quot; nếu muốn)
+                                  </p>
+                                </div>
                               </div>
-                            </div>
-                          )}
+                            );
+                          })()}
 
                           <p className="text-base font-bold text-slate-900">{item.questionText}</p>
 
@@ -1151,27 +1274,75 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               </p>
             </div>
 
+            {/* Step 1: Subject Selection */}
+            <div>
+              <label className="block text-xs font-bold text-slate-800 mb-2">
+                1. Chọn Môn học cần ra đề:
+              </label>
+              <div className="flex flex-wrap gap-2">
+                {(
+                  [
+                    { id: "math", label: "Toán", color: "sky" },
+                    { id: "vietnamese", label: "Tiếng Việt", color: "rose" },
+                    { id: "english", label: "Tiếng Anh", color: "emerald" },
+                    { id: "science", label: "Tự nhiên & Xã hội", color: "amber" },
+                    { id: "all", label: "Tất cả các môn (Trộn môn)", color: "purple" },
+                  ] as const
+                ).map((s) => {
+                  const isSel = genSubject === s.id;
+                  return (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => setGenSubject(s.id)}
+                      className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all border ${
+                        isSel
+                          ? "bg-slate-900 text-white border-slate-900 shadow-xs"
+                          : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+                      }`}
+                    >
+                      {isSel ? "✓ " : ""}
+                      {s.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[11px] text-slate-500 mt-1.5">
+                {genSubject === "all"
+                  ? "Chế độ Trộn môn: AI sẽ tạo đề tổng hợp gồm nhiều môn và tự động gán đúng môn cho từng câu."
+                  : `Chế độ Độc lập: AI chỉ tạo đề thuần túy cho môn ${
+                      SUBJECT_META[genSubject]?.label || genSubject
+                    }, tuyệt đối không lẫn câu hỏi môn khác.`}
+              </p>
+            </div>
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                  1. Chọn tài liệu Sách Giáo Khoa nguồn:
+                  2. Chọn tài liệu Sách Giáo Khoa nguồn:
                 </label>
-                <select
-                  value={genTextbookId}
-                  onChange={(e) => setGenTextbookId(e.target.value)}
-                  className="w-full px-3.5 py-2.5 text-xs rounded-lg border border-slate-200 bg-white font-semibold"
-                >
-                  {textbooks.map((tb) => (
-                    <option key={tb.id} value={tb.id}>
-                      [{SUBJECT_META[tb.subject].shortLabel} - Lớp {tb.grade}] {tb.title}
-                    </option>
-                  ))}
-                </select>
+                {availableGenTextbooks.length > 0 ? (
+                  <select
+                    value={genTextbookId}
+                    onChange={(e) => setGenTextbookId(e.target.value)}
+                    className="w-full px-3.5 py-2.5 text-xs rounded-lg border border-slate-200 bg-white font-semibold"
+                  >
+                    {availableGenTextbooks.map((tb) => (
+                      <option key={tb.id} value={tb.id}>
+                        [{SUBJECT_META[tb.subject].shortLabel} - Lớp {tb.grade}] {tb.title}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="p-2.5 rounded-lg border border-amber-200 bg-amber-50 text-[11px] text-amber-900 font-medium">
+                    Chưa có SGK cho môn này. AI sẽ tự động sinh câu hỏi theo chương trình chuẩn Lớp {grade}.
+                  </div>
+                )}
               </div>
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                  2. Model AI dùng để thiết kế đề:
+                  3. Model AI dùng để thiết kế đề:
                 </label>
                 <select
                   value={selectedModel}
@@ -1190,7 +1361,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                  3. Chọn mức độ ra đề:
+                  4. Chọn mức độ ra đề:
                 </label>
                 <div className="space-y-2">
                   <label
@@ -1242,7 +1413,7 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               <div className="space-y-4">
                 <div>
                   <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                    4. Số lượng câu hỏi muốn tạo (Chọn nhanh hoặc nhập tùy ý):
+                    5. Số lượng câu hỏi muốn tạo (Chọn nhanh hoặc nhập tùy ý):
                   </label>
                   <div className="flex flex-wrap items-center gap-1.5 mb-2">
                     {[5, 10, 15, 20, 30, 50].map((num) => (
@@ -1294,11 +1465,11 @@ export const TeacherPortal: React.FC<TeacherPortalProps> = ({
               </div>
             </div>
 
-            {/* Step 5: Dynamic Categories Extracted Directly from Selected Textbook's OCR Data */}
+            {/* Step 6: Dynamic Categories Extracted Directly from Selected Textbook's OCR Data */}
             <div className="space-y-2.5 p-4 rounded-xl bg-slate-50 border border-slate-200">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <label className="text-xs font-bold text-slate-800">
-                  5. Công thức, Quy tắc &amp; Dạng bài trích từ bài học “{currentSelectedTextbook?.title}”:
+                  6. Công thức, Quy tắc &amp; Dạng bài trích từ bài học “{currentSelectedTextbook?.title || "Chương trình chuẩn"}”:
                 </label>
                 <div className="flex items-center gap-2 text-[11px]">
                   <button

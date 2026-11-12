@@ -433,6 +433,7 @@ function extractTextbookLessons(extractedText: string): string[] {
 }
 
 interface QuestionCandidate {
+  subject?: string;
   topic: string;
   type: string;
   questionText: string;
@@ -445,25 +446,239 @@ interface QuestionCandidate {
   warning?: string;
 }
 
+function extractNumberSignature(text: string): string {
+  if (!text) return "";
+  const nums = (text.match(/\d+(?:[.,]\d+)?/g) || [])
+    .map((n) => parseFloat(n.replace(",", ".")))
+    .filter((n) => !isNaN(n))
+    .sort((a, b) => a - b);
+  return nums.join("_");
+}
+
+function extractStructureSkeleton(text: string): string {
+  if (!text) return "";
+  return normalizeForComparison(text)
+    .replace(/\d+(?:[.,]\d+)?/g, "#NUM#")
+    .replace(
+      /\b(?:lit|lít|l|kg|kilogam|g|gam|cm|dm|m|km|can|thung|thùng|be|bể|tui|túi|bao|goi|gói|chai|dau|dầu|xang|xăng|sua|sữa|nuoc|nước|mat|mật|gao|gạo|duong|đường|muoi|muối|cam|tao|táo|but|bút|vo|vở|thuoc|thước|hoc sinh|học sinh|ban|bạn|bong hoa|bông hoa|vien bi|viên bi|nam|hoa|lan|minh|hung|hùng|an|binh|bình|chi|ha|hà|linh)\b/g,
+      "#ENTITY#"
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isCloneQuestion(q1Text: string, q2Text: string): boolean {
+  if (!q1Text || !q2Text) return false;
+  const sig1 = extractNumberSignature(q1Text);
+  const sig2 = extractNumberSignature(q2Text);
+  // Both questions have matching number sets (at least 2 numbers, e.g. 45 and 15)
+  if (sig1 && sig2 && sig1 === sig2 && sig1.includes("_")) {
+    const skel1 = extractStructureSkeleton(q1Text);
+    const skel2 = extractStructureSkeleton(q2Text);
+    if (skel1 === skel2) return true;
+    const w1 = new Set(skel1.split(" "));
+    const w2 = new Set(skel2.split(" "));
+    let common = 0;
+    for (const w of w1) {
+      if (w2.has(w)) common++;
+    }
+    const overlap = common / Math.max(w1.size, w2.size);
+    if (overlap >= 0.7) return true;
+  }
+  return false;
+}
+
+function sanitizeAndValidateGeometry(q: QuestionCandidate, subjectId: string): void {
+  // Geometry is only relevant for math
+  if (subjectId !== "math" && subjectId !== "all") {
+    if (q.geometrySpec) q.geometrySpec = { hasGeometry: false };
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+
+  const text = q.questionText || "";
+  const lowerText = text.toLowerCase();
+
+  // Rule: polylines ("đường gấp khúc"), generic quadrilaterals ("tứ giác"), and word problems
+  // calculating perimeter or finding a missing side do NOT need figures.
+  const isMissingSideOrPerimeterProblem =
+    /(?:tìm|tính)\s+(?:độ dài\s+)?cạnh\s+(?:còn lại|thứ|đáy)|tính chu vi.*biết.*độ dài các cạnh/i.test(lowerText);
+  const isPolyline = /đường gấp khúc|poly-?line/i.test(lowerText);
+  const isGenericQuadrilateral =
+    /(?:hình\s+)?tứ giác/i.test(lowerText) &&
+    !/(?:chữ nhật|vuông|thang|bình hành)/i.test(lowerText);
+
+  if (isMissingSideOrPerimeterProblem || isPolyline || isGenericQuadrilateral) {
+    if (q.geometrySpec) q.geometrySpec = { hasGeometry: false };
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+
+  if (!q.geometrySpec || !q.geometrySpec.hasGeometry) {
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+
+  const validShapes = [
+    "rectangle",
+    "square",
+    "triangle",
+    "right_triangle",
+    "trapezoid",
+    "parallelogram",
+    "circle",
+    "composite_l",
+  ];
+  const shape = String(q.geometrySpec.shapeType || "").toLowerCase();
+
+  if (!validShapes.includes(shape)) {
+    q.geometrySpec = { hasGeometry: false };
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+
+  // Prevent absurd hallucinations (e.g. circle for polyline or quadrilateral)
+  if (shape === "circle" && !/(?:hình tròn|bán kính|đường kính|tâm\s+o)/i.test(lowerText)) {
+    q.geometrySpec = { hasGeometry: false };
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+  if (shape === "rectangle" && !/(?:hình chữ nhật|chiều dài|chiều rộng)/i.test(lowerText)) {
+    q.geometrySpec = { hasGeometry: false };
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+  if (shape === "square" && !/(?:hình vuông|cạnh hình vuông)/i.test(lowerText)) {
+    q.geometrySpec = { hasGeometry: false };
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+  if ((shape === "triangle" || shape === "right_triangle") && !/(?:tam giác|3 cạnh)/i.test(lowerText)) {
+    q.geometrySpec = { hasGeometry: false };
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+  if (shape === "trapezoid" && !/(?:hình thang|đáy lớn|đáy bé)/i.test(lowerText)) {
+    q.geometrySpec = { hasGeometry: false };
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+  if (shape === "parallelogram" && !/(?:hình bình hành)/i.test(lowerText)) {
+    q.geometrySpec = { hasGeometry: false };
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+  if (shape === "composite_l" && !/(?:chữ l|hình ghép|ghép bởi)/i.test(lowerText)) {
+    q.geometrySpec = { hasGeometry: false };
+    if (q.type === "geometry_visual") q.type = "multiple_choice";
+    return;
+  }
+
+  // Verify dimensions on figure match numbers mentioned in the question text
+  const numbersInText = (text.match(/\d+(?:[.,]\d+)?/g) || []).map((n) =>
+    parseFloat(n.replace(",", "."))
+  );
+
+  const specNums = [
+    q.geometrySpec.width,
+    q.geometrySpec.height,
+    q.geometrySpec.sideA,
+    q.geometrySpec.sideB,
+    q.geometrySpec.sideC,
+    q.geometrySpec.topWidth,
+  ].filter((v): v is number => typeof v === "number" && v > 0);
+
+  // If any dimension on the figure does not appear in the question text (e.g. 50cm vs 5cm), disable figure
+  for (const num of specNums) {
+    const matches = numbersInText.some((tn) => Math.abs(tn - num) < 0.001);
+    if (!matches) {
+      q.geometrySpec = { hasGeometry: false };
+      if (q.type === "geometry_visual") q.type = "multiple_choice";
+      return;
+    }
+  }
+}
+
 function validateQuestionCode(
   q: QuestionCandidate,
   subjectId: string,
   existingNormalizedSet: Set<string>,
-  batchNormalizedSet: Set<string>
+  batchNormalizedSet: Set<string>,
+  existingRawQuestions: Array<{ questionText: string }>,
+  batchRawQuestions: QuestionCandidate[]
 ): { valid: boolean; fatalError?: string; warning?: string } {
   if (!q.questionText || typeof q.questionText !== "string" || q.questionText.trim().length < 8) {
     return { valid: false, fatalError: "Nội dung câu hỏi quá ngắn hoặc rỗng." };
   }
 
-  const normQ = normalizeForComparison(q.questionText);
-  if (existingNormalizedSet.has(normQ) || batchNormalizedSet.has(normQ)) {
-    return { valid: false, fatalError: "Câu hỏi bị trùng lặp với câu đã có." };
+  // 1. Strict Subject Isolation
+  const lowerText = q.questionText.toLowerCase();
+  const lowerTopic = (q.topic || "").toLowerCase();
+
+  if (subjectId === "math") {
+    // Check if contaminated by Vietnamese language or English
+    const isVietnameseTopic =
+      /(?:tiếng việt|tập đọc|chính tả|từ chỉ sự vật|từ chỉ hoạt động|từ chỉ đặc điểm|danh từ|động từ|tính từ|dấu chấm|dấu phẩy|vần\s+\w+|âm\s+\w+|điền âm|ghép chữ|đoạn văn)/i.test(
+        lowerTopic + " " + lowerText
+      );
+    const isEnglishTopic =
+      /(?:tiếng anh|english|vocabulary|grammar|look at the picture|choose the correct|fill in the blank with|what is this|how many|spell the word)/i.test(
+        lowerTopic + " " + lowerText
+      );
+    if (isVietnameseTopic) {
+      return { valid: false, fatalError: "Câu hỏi thuộc môn Tiếng Việt nhưng đang tạo môn Toán." };
+    }
+    if (isEnglishTopic) {
+      return { valid: false, fatalError: "Câu hỏi thuộc môn Tiếng Anh nhưng đang tạo môn Toán." };
+    }
+    // Clean topic prefix if Gemini added one
+    q.topic = q.topic.replace(/^(?:Toán|Tiếng Việt|Tiếng Anh)\s*[-:]\s*/i, "").trim();
+  } else if (subjectId === "vietnamese") {
+    const isMathTopic =
+      /(?:toán|phép tính|chu vi|diện tích|hình chữ nhật|hình vuông|hình tam giác|\d+\s*[+\-×÷=]\s*\d+)/i.test(
+        lowerTopic + " " + lowerText
+      );
+    if (isMathTopic) {
+      return { valid: false, fatalError: "Câu hỏi thuộc môn Toán nhưng đang tạo môn Tiếng Việt." };
+    }
+    q.topic = q.topic.replace(/^(?:Toán|Tiếng Việt|Tiếng Anh)\s*[-:]\s*/i, "").trim();
+  } else if (subjectId === "english") {
+    const isMathOrVn =
+      /(?:toán|chu vi|diện tích|tiếng việt|chính tả|từ chỉ sự vật)/i.test(
+        lowerTopic + " " + lowerText
+      );
+    if (isMathOrVn) {
+      return { valid: false, fatalError: "Câu hỏi bị lẫn môn ngoài Tiếng Anh." };
+    }
+    q.topic = q.topic.replace(/^(?:Toán|Tiếng Việt|Tiếng Anh)\s*[-:]\s*/i, "").trim();
   }
 
-  // 1. Multiple choice & Geometry visual checks
+  // 2. Strict Anti-duplication & Anti-clone Check
+  const normQ = normalizeForComparison(q.questionText);
+  if (existingNormalizedSet.has(normQ) || batchNormalizedSet.has(normQ)) {
+    return { valid: false, fatalError: "Câu hỏi bị trùng lặp nguyên văn với câu đã có." };
+  }
+
+  for (const ex of existingRawQuestions) {
+    if (ex && ex.questionText && isCloneQuestion(q.questionText, ex.questionText)) {
+      return { valid: false, fatalError: "Câu hỏi trùng bộ số liệu và cấu trúc với câu trong kho." };
+    }
+  }
+
+  for (const bq of batchRawQuestions) {
+    if (bq && bq.questionText && isCloneQuestion(q.questionText, bq.questionText)) {
+      return { valid: false, fatalError: "Câu hỏi trùng bộ số liệu và cấu trúc với câu khác trong cùng đợt." };
+    }
+  }
+
+  // 3. Sanitize and validate geometry
+  sanitizeAndValidateGeometry(q, subjectId);
+
+  const warnings: string[] = [];
+
+  // 4. Multiple choice validation (do NOT require options for fill_blank or numeric questions)
   if (
     q.type === "multiple_choice" ||
-    q.type === "geometry_visual" ||
     (Array.isArray(q.options) && q.options.length > 0)
   ) {
     if (!Array.isArray(q.options) || q.options.length < 3) {
@@ -493,41 +708,80 @@ function validateQuestionCode(
     }
   }
 
-  // 2. Visual cue check: "nhìn hình", "xem hình", "look at the picture", "bảng" without visual
+  // 5. Visual cue check: "nhìn hình", "xem hình", "look at the picture", "bảng" without visual
   const visualRegex =
     /(?:nhìn|quan sát|xem)\s+(?:hình|tranh|bức tranh|ảnh|bảng|thời khóa biểu)|look at the (?:picture|image|table)/i;
   const hasGeo = Boolean(q.geometrySpec?.hasGeometry);
   if (visualRegex.test(q.questionText) && !hasGeo) {
-    return {
-      valid: true,
-      warning: "Đề bài nhắc 'xem hình/bảng' nhưng câu hỏi không đính kèm hình vẽ trực quan.",
-    };
+    warnings.push("Đề bài nhắc 'xem hình/bảng' nhưng câu hỏi không đính kèm hình vẽ trực quan.");
   }
 
-  // 3. Audio leakage check
+  // 6. Audio Text Checks
   if (q.audioText && typeof q.audioText === "string") {
-    const isListeningTask =
-      /nghe|listen/i.test(q.questionText) && (q.type === "fill_blank" || !visualRegex.test(q.questionText));
+    // Check & auto-clean "chấm chấm chấm" or "..."
+    if (/\.{3,}|…|chấm\s+chấm/i.test(q.audioText)) {
+      q.audioText = q.audioText
+        .replace(/\.{3,}|…/g, " gạch ngang ")
+        .replace(/chấm\s+chấm(?:\s+chấm)?/gi, "gạch ngang")
+        .replace(/\s+/g, " ")
+        .trim();
+      warnings.push("audio đọc chỗ trống thành 'chấm chấm chấm' (đã tự động chuẩn hóa sang 'gạch ngang').");
+    }
+
     const normAudio = normalizeForComparison(q.audioText);
     const normAns = normalizeForComparison(q.correctAnswer || "");
+    const normText = normalizeForComparison(q.questionText || "");
 
-    if (!isListeningTask && normAns.length >= 3 && normAudio.includes(normAns)) {
-      return {
-        valid: true,
-        warning: `audioText (${q.audioText}) có thể làm lộ đáp án (${q.correctAnswer}).`,
-      };
+    // ONLY warn if audio reveals answer that is NOT displayed on the question text (e.g. listening test where answer is supposed to be hidden)
+    // If the sentence is already visible in questionText, reading it aloud is helpful audio assistance, NOT a leak!
+    const isListeningDictation = /nghe|listen/i.test(q.questionText);
+    if (
+      isListeningDictation &&
+      normAns.length >= 3 &&
+      normAudio.includes(normAns) &&
+      !normText.includes(normAns)
+    ) {
+      warnings.push(`audioText (${q.audioText}) có thể làm lộ từ cần điền (${q.correctAnswer}).`);
     }
   }
 
-  // 4. English cannot have geometry calculation
-  if (subjectId === "english" && hasGeo) {
-    return {
-      valid: true,
-      warning: "Môn Tiếng Anh không nên chứa câu hỏi tính toán hình học.",
-    };
+  // 7. Text checks: "chọn từ / khoanh vào" without options
+  const requiresOptionsRegex =
+    /(?:khoanh\s+vào|chọn\s+(?:đáp\s+án|từ|câu|phương\s+án)|chọn\s+đúng|chọn\s+sai)/i;
+  if (
+    requiresOptionsRegex.test(q.questionText) &&
+    (!Array.isArray(q.options) || q.options.length < 2)
+  ) {
+    warnings.push("Đề bài ghi 'chọn từ/chọn câu/khoanh vào' nhưng không có các phương án lựa chọn (options).");
   }
 
-  return { valid: true };
+  // 8. Text mentions "các từ cho trước" without words
+  const givenWordsRegex = /(?:các\s+từ|những\s+từ|từ\s+ngữ)\s+(?:cho\s+trước|dưới\s+đây|sau\s+đây)/i;
+  if (givenWordsRegex.test(q.questionText)) {
+    const hasBracketsOrList =
+      /\[.+\]|\(.+\)|“[^”]+”|"[^"]+"/.test(q.questionText) ||
+      (Array.isArray(q.options) && q.options.length >= 2);
+    if (!hasBracketsOrList) {
+      warnings.push("Đề bài nhắc 'các từ cho trước' nhưng không liệt kê danh sách từ.");
+    }
+  }
+
+  // 9. Open fill-in with only 1 acceptedAnswer when multiple words are plausible
+  if (q.type === "fill_blank" && (!q.options || q.options.length === 0)) {
+    const isOpenFill =
+      /(?:đang\s+\.{2,}|rất\s+\.{2,}|thật\s+\.{2,}|quá\s+\.{2,})/i.test(q.questionText);
+    const acceptedCount = (q.acceptedAnswers || []).length;
+    if (isOpenFill && acceptedCount <= 1) {
+      warnings.push(
+        "Câu điền từ mở có thể có nhiều đáp án hợp lý nhưng danh sách acceptedAnswers chỉ có 1 phương án."
+      );
+    }
+  }
+
+  return {
+    valid: true,
+    warning: warnings.length > 0 ? warnings.join(" | ") : undefined,
+  };
 }
 
 // 2. Generate Exam Questions from Scanned Textbook Data or Weak Topics
@@ -613,6 +867,10 @@ TUYỆT ĐỐI KHÔNG dùng kiến thức lớp 1 tầm thường (như đếm 1
       items: {
         type: Type.OBJECT,
         properties: {
+          subject: {
+            type: Type.STRING,
+            description: "Môn học: 'math', 'vietnamese', 'english', hoặc 'science'",
+          },
           topic: {
             type: Type.STRING,
             description: "Chuyên đề ngắn gọn, ví dụ: 'Tính chu vi hình chữ nhật'",
@@ -669,31 +927,54 @@ TUYỆT ĐỐI KHÔNG dùng kiến thức lớp 1 tầm thường (như đếm 1
       },
     };
 
+    const subjectSpecificInstruction =
+      subjectId === "all"
+        ? "ĐANG TẠO ĐỀ TỔNG HỢP (TRỘN TẤT CẢ CÁC MÔN: Toán, Tiếng Việt, Tiếng Anh, Khoa học). BẮT BUỘC mỗi câu phải gắn đúng mã trường 'subject' ('math', 'vietnamese', 'english', 'science')."
+        : `BẮT BUỘC: ĐỀ THI NÀY CHỈ DÀNH RIÊNG CHO MÔN ${String(subject || "Toán").toUpperCase()} (mã môn: ${subjectId}).
+CẤM TUYỆT ĐỐI tạo câu hỏi thuộc môn khác (chọn Toán thì CẤM ra câu Tiếng Việt, Tiếng Anh hay Khoa học).
+Trường 'topic' phải là tên chuyên đề thuần túy của môn ${subject || "Toán"}, CẤM gắn tiền tố môn khác như 'Tiếng Việt - ...' hay 'Tiếng Anh - ...'.`;
+
+    const grade2EnglishConstraint =
+      subjectId === "english" || subject === "Tiếng Anh"
+        ? `\nĐẶC BIỆT MÔN TIẾNG ANH TIỂU HỌC:
+- CHỈ sử dụng từ vựng và cấu trúc câu đơn giản có trong SGK lớp ${grade} đã lưu (chào hỏi, gia đình, đồ dùng học tập, màu sắc, số đếm 1-20, con vật, thức ăn).
+- TUYỆT ĐỐI TRÁNH các cấu trúc ngữ pháp chưa học của lớp lớn hơn như thì hiện tại đơn ngôi thứ ba số ít thêm s/es ('doesn't like', 'likes', 'plays', 'watches'), thì quá khứ, hay câu bị động.`
+        : "";
+
     // Helper to generate a batch of questions
     const generateBatch = async (requestCount: number, forbiddenList: string[] = []) => {
       const prompt = `Bạn là giáo viên tiểu học giỏi tại Việt Nam đang ra đề cho học sinh Lớp ${grade}, môn ${subject}.
 Hãy dựa vào dữ liệu sách giáo khoa dưới đây để tạo đúng ${requestCount} câu hỏi chất lượng cao.
 
+${subjectSpecificInstruction}
+${grade2EnglishConstraint}
 ${levelInstruction}
 ${weakTopicContext}
 ${categoryContext}
 ${existingContext}
-${forbiddenList.length > 0 ? `\nCÁC CÂU VỪA TẠO TRONG ĐỢT NÀY (KHÔNG ĐƯỢC LẶP LẠI TỪ VỰNG HOẶC ĐÁP ÁN):\n${forbiddenList.join("\n")}` : ""}
+${forbiddenList.length > 0 ? `\nCÁC CÂU VỪA TẠO TRONG ĐỢT NÀY (KHÔNG ĐƯỢC LẶP LẠI TỪ VỰNG, ĐÁP ÁN HOẶC BỘ SỐ LIỆU):\n${forbiddenList.join("\n")}` : ""}
 
 Dữ liệu sách giáo khoa (Đang xoay vòng Bài/Phần ${activeLessonIndex + 1}/${lessons.length}):
 ${JSON.stringify(compactTextbook, null, 2)}
 
 LUẬT RA ĐỀ BẮT BUỘC (TUÂN THỦ 100%):
-1. TỰ ĐỦ DỮ KIỆN: Mỗi câu hỏi PHẢI TỰ ĐỦ 100% DỮ KIỆN để học sinh giải được. CẤM TUYỆT ĐỐI các câu 'Look at the picture', 'Xem hình', 'Dựa vào bảng/thời khóa biểu' nếu không có hình vẽ thật trong geometrySpec hoặc đoạn văn trong đề. Toán có lời văn phải đủ số liệu tính toán.
-2. ĐÚNG DUY NHẤT 1 ĐÁP ÁN: Trắc nghiệm phải có ĐÚNG MỘT đáp án đúng. Phải xét kỹ viết tắt ('She is' vs 'She\\'s'), mạo từ ('a'/'an'/'the'), chữ hoa/thường ('Bạn nam' vs 'Bạn Nam'). Ba đáp án nhiễu phải sai thật sự và không trùng nhau.
-3. ĐIỀN TỪ MỞ: Nếu câu hỏi có nhiều từ cùng có thể đúng ('đang ... sách', 'rất ...'), hãy chuyển sang trắc nghiệm 4 đáp án HOẶC cung cấp mảng "acceptedAnswers" chứa các từ đồng nghĩa (ví dụ: ["đọc", "xem"]).
-4. KHÔNG HỎI DỮ KIỆN TÙY Ý: Không hỏi tuổi, tên người tùy ý mà bài đọc không nêu.
-5. SẮP XẾP TỪ THÀNH CÂU: Mảng "options" PHẢI LÀ 4 CÂU HOÀN CHỈNH (1 câu đúng ngữ pháp, 3 câu sai trật tự từ để học sinh chọn), KHÔNG ĐỂ options là từng từ rời.
-6. ĐIỀN ÂM/VẦN (Tiếng Việt): Dấu chấm lửng '...' phải thay thế đúng âm/vần. Khi ghép đáp án vào PHẢI TẠO THÀNH TỪ CÓ NGHĨA chuẩn chính tả tiếng Việt quen thuộc với học sinh lớp ${grade}.
-7. XẾP CHỮ CÁI THÀNH TỪ (Tiếng Anh): Kiểm tra đủ và đúng từng chữ cái 1-1, không thừa thiếu chữ.
-8. MÔN TIẾNG ANH: TUYỆT ĐỐI KHÔNG ra câu hỏi hình học (chu vi, diện tích). Môn Toán có hình thì số đo trên hình phải khớp đề và không ghi sẵn đáp án lên hình.
-9. AUDIO TEXT: Với câu ngữ pháp/chính tả CHỈ ĐỌC ĐỀ BÀI, KHÔNG CHỨA ĐÁP ÁN. Chỉ riêng câu nghe điền từ mới đọc từ cần điền (và khi đó questionText không được viết lộ từ đó ra).
-10. ĐA DẠNG: Mỗi câu trong ${requestCount} câu phải thuộc dạng bài hoặc chủ đề khác nhau. Mỗi từ vựng hoặc số liệu đáp án chỉ xuất hiện 1 lần.`;
+1. PHÂN BỔ DẠNG BÀI & CHỐNG TRÙNG:
+   (a) MỖI DẠNG BÀI / CẤU TRÚC PHÉP TÍNH TỐI ĐA 2 CÂU trong mỗi lần tạo. Tuyệt đối không tạo nhiều câu cùng dạng bài hay cùng một công thức tính (ví dụ: không sinh 4-5 bài đều là 'rót thêm can dầu/xăng' hay đều là 'tìm x').
+   (b) BẮT BUỘC phân bổ đều theo các chủ đề chuẩn SGK của môn:
+       - Môn Toán: (1) Phép cộng trừ có nhớ trong phạm vi 100/1000; (2) Bảng nhân chia; (3) Đơn vị đo đại lượng (dm, m, km, kg, lít, đồng); (4) Xem đồng hồ, ngày tháng, lịch; (5) Tìm thành phần chưa biết (tìm x, số hạng, thừa số, số bị trừ, số bị chia); (6) So sánh số và thứ tự số; (7) Hình học nhận biết (đoạn thẳng, đường gấp khúc, 3 điểm thẳng hàng, góc vuông, đếm hình); (8) Toán giải bằng 1-2 bước tính.
+       - Môn Tiếng Việt: (1) Từ chỉ sự vật, hoạt động, đặc điểm; (2) Các kiểu câu Ai là gì / Ai làm gì / Ai thế nào; (3) Dấu câu; (4) Điền âm vần chính tả; (5) Đọc hiểu đoạn văn ngắn.
+2. TỰ ĐỦ DỮ KIỆN: Mỗi câu hỏi PHẢI TỰ ĐỦ 100% DỮ KIỆN để học sinh giải được. CẤM TUYỆT ĐỐI các câu 'Look at the picture', 'Xem hình', 'Dựa vào bảng/thời khóa biểu' nếu không có hình vẽ thật trong geometrySpec hoặc đoạn văn trong đề. Toán có lời văn phải đủ số liệu tính toán.
+3. HÌNH VẼ MINH HỌA (geometrySpec):
+   - Chỉ bật hasGeometry=true khi hình vẽ khớp 100% với đề (chỉ hỗ trợ: rectangle, square, triangle, right_triangle, trapezoid, parallelogram, circle, composite_l) VÀ mọi số đo trên hình PHẢI XUẤT HIỆN trong đề bài.
+   - Các bài về 'đường gấp khúc', 'hình tứ giác' tùy ý, hoặc bài toán lời văn tính chu vi / tìm cạnh còn lại thì TUYỆT ĐỐI KHÔNG DÙNG HÌNH (hasGeometry: false).
+4. ĐÚNG DUY NHẤT 1 ĐÁP ÁN: Trắc nghiệm phải có ĐÚNG MỘT đáp án đúng. Phải xét kỹ viết tắt ('She is' vs 'She\\'s'), mạo từ ('a'/'an'/'the'), chữ hoa/thường ('Bạn nam' vs 'Bạn Nam'). Ba đáp án nhiễu phải sai thật sự và không trùng nhau.
+5. ĐIỀN TỪ MỞ: Nếu câu hỏi có nhiều từ cùng có thể đúng ('đang ... sách', 'rất ...'), hãy chuyển sang trắc nghiệm 4 đáp án HOẶC cung cấp mảng "acceptedAnswers" chứa các từ đồng nghĩa (ví dụ: ["đọc", "xem"]).
+6. KHÔNG HỎI DỮ KIỆN TÙY Ý: Không hỏi tuổi, tên người tùy ý mà bài đọc không nêu.
+7. SẮP XẾP TỪ THÀNH CÂU: Mảng "options" PHẢI LÀ 4 CÂU HOÀN CHỈNH (1 câu đúng ngữ pháp, 3 câu sai trật tự từ để học sinh chọn), KHÔNG ĐỂ options là từng từ rời.
+8. ĐIỀN ÂM/VẦN (Tiếng Việt): Dấu chấm lửng '...' phải thay thế đúng âm/vần. Khi ghép đáp án vào PHẢI TẠO THÀNH TỪ CÓ NGHĨA chuẩn chính tả tiếng Việt quen thuộc với học sinh lớp ${grade}.
+9. XẾP CHỮ CÁI THÀNH TỪ (Tiếng Anh): Kiểm tra đủ và đúng từng chữ cái 1-1, không thừa thiếu chữ.
+10. MÔN TIẾNG ANH: TUYỆT ĐỐI KHÔNG ra câu hỏi hình học (chu vi, diện tích).
+11. AUDIO TEXT: Với câu ngữ pháp/chính tả CHỈ ĐỌC ĐỀ BÀI, KHÔNG CHỨA ĐÁP ÁN. Chỉ riêng câu nghe điền từ mới đọc từ cần điền (và khi đó questionText không được viết lộ từ đó ra). Tuyệt đối không đọc dấu chấm lửng thành 'chấm chấm chấm'.`;
 
       const response = await ai.models.generateContent({
         model,
@@ -713,14 +994,29 @@ LUẬT RA ĐỀ BẮT BUỘC (TUÂN THỦ 100%):
 
     const batchNormalizedSet = new Set<string>();
     const batchAnswerSet = new Set<string>();
+    const topicFormatCountMap = new Map<string, number>();
     const verifiedQuestions: QuestionCandidate[] = [];
 
-    // 4. Code-based validation & deduplication
+    // 4. Code-based validation, anti-clone & topic balance check
     for (const q of rawQuestions) {
       if (!q) continue;
-      const codeCheck = validateQuestionCode(q, String(subjectId), existingNormalizedSet, batchNormalizedSet);
+      const codeCheck = validateQuestionCode(
+        q,
+        String(subjectId),
+        existingNormalizedSet,
+        batchNormalizedSet,
+        existingQuestions,
+        verifiedQuestions
+      );
       if (!codeCheck.valid) {
-        continue; // Discard invalid or duplicate question
+        continue; // Discard invalid, duplicate, or clone question
+      }
+
+      // Cap each topic/format template at max 2 questions per batch to avoid repetitive formats
+      const normTopicKey = normalizeForComparison(q.topic || "chung");
+      const currentTopicCount = topicFormatCountMap.get(normTopicKey) || 0;
+      if (currentTopicCount >= 2 && verifiedQuestions.length + 1 < count) {
+        continue; // Skip excess questions of same format, leave room for other topics
       }
 
       // Check unique answer key in this batch
@@ -731,6 +1027,7 @@ LUẬT RA ĐỀ BẮT BUỘC (TUÂN THỦ 100%):
 
       batchNormalizedSet.add(normalizeForComparison(q.questionText));
       if (normAns.length > 1) batchAnswerSet.add(normAns);
+      topicFormatCountMap.set(normTopicKey, currentTopicCount + 1);
 
       if (codeCheck.warning) {
         q.warning = codeCheck.warning;
@@ -754,15 +1051,22 @@ LUẬT RA ĐỀ BẮT BUỘC (TUÂN THỦ 100%):
               q,
               String(subjectId),
               existingNormalizedSet,
-              batchNormalizedSet
+              batchNormalizedSet,
+              existingQuestions,
+              verifiedQuestions
             );
             if (!codeCheck.valid) continue;
+
+            const normTopicKey = normalizeForComparison(q.topic || "chung");
+            const currentTopicCount = topicFormatCountMap.get(normTopicKey) || 0;
+            if (currentTopicCount >= 3) continue;
 
             const normAns = normalizeForComparison(q.correctAnswer || "");
             if (normAns.length > 1 && batchAnswerSet.has(normAns) && q.type !== "true_false") continue;
 
             batchNormalizedSet.add(normalizeForComparison(q.questionText));
             if (normAns.length > 1) batchAnswerSet.add(normAns);
+            topicFormatCountMap.set(normTopicKey, currentTopicCount + 1);
 
             if (codeCheck.warning) q.warning = codeCheck.warning;
             verifiedQuestions.push(q);
@@ -785,11 +1089,14 @@ LUẬT RA ĐỀ BẮT BUỘC (TUÂN THỦ 100%):
         }));
 
         const auditPrompt = `Bạn là Chuyên gia Khảo thí và Kiểm định Đề thi Tiểu học Việt Nam.
-Hãy thẩm định danh sách ${auditItems.length} câu hỏi sau theo 4 tiêu chí nghiêm ngặt:
+Hãy thẩm định danh sách ${auditItems.length} câu hỏi sau theo các tiêu chí nghiêm ngặt:
 1. ĐÁP ÁN: Đáp án đúng có chuẩn xác 100% không?
 2. TÍNH DUY NHẤT: Trắc nghiệm có ĐÚNG DUY NHẤT 1 đáp án không? (Xét cả viết tắt, mạo từ, chữ hoa/thường).
 3. ĐỦ DỮ KIỆN: Đề bài có tự đủ 100% dữ kiện không? (Có bị thiếu số liệu hoặc nhắc 'nhìn hình/bảng' mà không có không?).
-4. LỘ ĐÁP ÁN: Đề bài hoặc audioText có vô tình viết lộ đáp án ra không?
+4. LỘ ĐÁP ÁN: Chỉ cảnh báo lộ đáp án khi bài nghe (dictation) giấu từ cần điền nhưng audioText lại đọc lộ ra. Nếu câu/đoạn văn đã in sẵn đầy đủ trên đề bài thì audio đọc là hoàn toàn bình thường để hỗ trợ bé, KHÔNG ĐƯỢC BÁO LỖI.
+5. LƯU Ý VỀ OPTIONS & AUDIO:
+   - Câu điền từ/điền số (fill_blank) thì options rỗng là bình thường, KHÔNG ĐƯỢC BÁO LỖI THIẾU OPTIONS.
+   - audioText rỗng hoặc không có audio KHÔNG PHẢI LÀ LỖI.
 
 Danh sách câu hỏi cần thẩm định:
 ${JSON.stringify(auditItems, null, 2)}

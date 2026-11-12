@@ -864,13 +864,57 @@ export default function App() {
                     )
                   )
                 }
-                onApproveAllPending={() =>
-                  setQuestions((prev) =>
-                    prev.map((q) =>
-                      q.status === "pending_review" && !q.warning ? { ...q, status: "approved" } : q
-                    )
-                  )
-                }
+                onApproveAllPending={() => {
+                  const numsOf = (text: string) =>
+                    (text.match(/\d+(?:[.,]\d+)?/g) || [])
+                      .map((n) => parseFloat(n.replace(",", ".")))
+                      .filter((n) => !isNaN(n))
+                      .sort((a, b) => a - b)
+                      .join("_");
+
+                  const skelOf = (text: string) =>
+                    text
+                      .toLowerCase()
+                      .normalize("NFD")
+                      .replace(/[\u0300-\u036f]/g, "")
+                      .replace(/[.,/#!$%^&*;:{}=\-_`~()?"'’“”[\]]/g, "")
+                      .replace(/\d+(?:[.,]\d+)?/g, "#NUM#")
+                      .replace(
+                        /\b(?:lit|lít|l|kg|kilogam|g|gam|cm|dm|m|km|can|thung|thùng|be|bể|tui|túi|bao|goi|gói|chai|dau|dầu|xang|xăng|sua|sữa|nuoc|nước|mat|mật|gao|gạo|duong|đường|muoi|muối|cam|tao|táo|but|bút|vo|vở|thuoc|thước|hoc sinh|học sinh|ban|bạn|bong hoa|bông hoa|vien bi|viên bi|nam|hoa|lan|minh|hung|hùng|an|binh|bình|chi|ha|hà|linh)\b/g,
+                        "#ENTITY#"
+                      )
+                      .replace(/\s+/g, " ")
+                      .trim();
+
+                  setQuestions((prev) => {
+                    const approvedPool = prev.filter((q) => q.status === "approved");
+                    return prev.map((q) => {
+                      if (q.status !== "pending_review") return q;
+                      if (q.warning) return q;
+
+                      // Exclude clone questions
+                      const cSig = numsOf(q.questionText);
+                      if (cSig && cSig.includes("_")) {
+                        const cSkel = skelOf(q.questionText);
+                        const isClone = approvedPool.some((ex) => {
+                          if (numsOf(ex.questionText) !== cSig) return false;
+                          const exSkel = skelOf(ex.questionText);
+                          if (exSkel === cSkel) return true;
+                          const w1 = new Set(cSkel.split(" "));
+                          const w2 = new Set(exSkel.split(" "));
+                          let common = 0;
+                          for (const w of w1) {
+                            if (w2.has(w)) common++;
+                          }
+                          return common / Math.max(w1.size, w2.size) >= 0.7;
+                        });
+                        if (isClone) return q;
+                      }
+
+                      return { ...q, status: "approved" };
+                    });
+                  });
+                }}
                 onDeleteQuestion={(id) =>
                   setQuestions((prev) => prev.filter((q) => q.id !== id))
                 }
